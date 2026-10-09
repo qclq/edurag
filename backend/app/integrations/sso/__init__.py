@@ -1,0 +1,1 @@
+"""SSO provider adapters."""
