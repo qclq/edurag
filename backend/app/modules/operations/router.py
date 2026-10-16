@@ -6,24 +6,25 @@ from datetime import timedelta
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import PageParams, get_current_user, get_page_params, is_super_admin, require_permissions
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError, paginated, success
 from app.core.security import utcnow
 from app.db.session import get_db
-from app.modules.conversations.models import Conversation, Message, MessageCitation, MessageRating
-from app.modules.conversations.service import message_payload
+from app.modules.conversations.models import Conversation, MessageRating
 from app.modules.documents.models import Document
 from app.modules.feedback.models import Feedback, FeedbackEvent
 from app.modules.feedback.schemas import FeedbackResolve
+from app.modules.knowledge_bases.models import KnowledgeBase
 from app.modules.knowledge_bases.service import can_access, get_kb_or_404, list_accessible
-from app.modules.operations.models import AuditLog, Notification, SystemSetting
-from app.modules.operations.schemas import ReportCreate, SettingsUpdate
+from app.modules.operations.models import AuditLog, KnowledgeGap, Notification, QaArchiveSummary, QaRecord, SystemSetting
+from app.modules.operations.retention import backfill_admin_records
+from app.modules.operations.schemas import KnowledgeGapSupplement, ReportCreate, SettingsUpdate
 from app.modules.operations.service import notify, record_audit
 from app.modules.tasks.models import ProcessingTask
-from app.modules.tasks.service import create_task, task_payload
+from app.modules.tasks.service import administrator_failure_payload, create_task, task_payload
 from app.modules.users.models import User
 
 
@@ -85,25 +86,25 @@ def dashboard(
     start = _range_start(range)
     super_admin = is_super_admin(user)
     managed_ids = {kb.id for kb in list_accessible(db, user, "manage")}
-    conversations = db.scalars(
-        select(Conversation)
-        .options(selectinload(Conversation.knowledge_bases))
-        .where(Conversation.created_at >= start, Conversation.deleted_at.is_(None))
+    if backfill_admin_records(db):
+        db.commit()
+    qa_records = db.scalars(
+        select(QaRecord)
+        .options(selectinload(QaRecord.knowledge_bases))
+        .where(QaRecord.created_at >= start)
     ).unique().all()
-    if not super_admin:
-        conversations = [
-            item for item in conversations
-            if managed_ids.intersection(kb.id for kb in item.knowledge_bases)
-        ]
-    conversation_ids = {item.id for item in conversations}
-    assistant_messages = db.scalars(
-        select(Message).where(
-            Message.role == "assistant",
-            Message.created_at >= start,
-            Message.conversation_id.in_(conversation_ids) if conversation_ids else Message.id.is_(None),
-        )
+    summaries = db.scalars(
+        select(QaArchiveSummary).where(QaArchiveSummary.summary_date >= start.date())
     ).all()
-    message_ids = {item.id for item in assistant_messages}
+    if not super_admin:
+        external_user_ids = set(db.scalars(select(User.id).where(User.user_type == "external")).all())
+        qa_records = [
+            item for item in qa_records
+            if item.user_id not in external_user_ids
+            and managed_ids.intersection(kb.id for kb in item.knowledge_bases)
+        ]
+        summaries = [item for item in summaries if item.knowledge_base_id in managed_ids]
+    message_ids = {item.source_message_id for item in qa_records}
     ratings = db.scalars(
         select(MessageRating).where(
             MessageRating.created_at >= start,
@@ -116,28 +117,37 @@ def dashboard(
         tasks = [item for item in tasks if item.knowledge_base_id in managed_ids]
         documents = [item for item in documents if item.knowledge_base_id in managed_ids]
     daily = defaultdict(lambda: {"questions": 0, "answered": 0, "noAnswer": 0})
-    for message in assistant_messages:
-        key = message.created_at.date().isoformat()
+    for record in qa_records:
+        key = record.created_at.date().isoformat()
         daily[key]["questions"] += 1
-        if message.status == "completed":
+        if record.status == "completed":
             daily[key]["answered"] += 1
-        elif message.status == "no_answer":
+        elif record.status == "no_answer":
             daily[key]["noAnswer"] += 1
-    helpful = sum(item.value == "helpful" for item in ratings)
+    for summary in summaries:
+        key = summary.summary_date.isoformat()
+        daily[key]["questions"] += summary.question_count
+        daily[key]["answered"] += summary.answered_count
+        daily[key]["noAnswer"] += summary.no_answer_count
+    archived_question_count = sum(item.question_count for item in summaries)
+    question_count = len(qa_records) + archived_question_count
+    answered_count = sum(item.status == "completed" for item in qa_records) + sum(item.answered_count for item in summaries)
+    helpful = sum(item.value == "helpful" for item in ratings) + sum(item.helpful_count for item in summaries)
+    unhelpful = sum(item.value == "unhelpful" for item in ratings) + sum(item.unhelpful_count for item in summaries)
     return success(
         request,
         {
             "range": range,
             "metrics": {
-                "conversationCount": len(conversations),
-                "questionCount": len(assistant_messages),
-                "answerRate": round(sum(item.status == "completed" for item in assistant_messages) / max(1, len(assistant_messages)), 4),
-                "satisfactionRate": round(helpful / max(1, len(ratings)), 4),
+                "conversationCount": len({item.source_conversation_id for item in qa_records}),
+                "questionCount": question_count,
+                "answerRate": round(answered_count / max(1, question_count), 4),
+                "satisfactionRate": round(helpful / max(1, helpful + unhelpful), 4),
                 "documentCount": len(documents),
                 "failedTaskCount": sum(item.status == "failed" for item in tasks),
             },
             "trend": [{"date": key, **value} for key, value in sorted(daily.items())],
-            "satisfaction": {"helpful": helpful, "unhelpful": sum(item.value == "unhelpful" for item in ratings), "unrated": max(0, len(assistant_messages) - len(ratings))},
+            "satisfaction": {"helpful": helpful, "unhelpful": unhelpful, "unrated": max(0, question_count - helpful - unhelpful)},
             "taskStatus": dict(Counter(item.status for item in tasks)),
             "providerStatus": None,
         },
@@ -153,32 +163,91 @@ def knowledge_gaps(
     user: User = Depends(require_permissions("qa.analytics")),
     db: Session = Depends(get_db),
 ):
-    messages = db.scalars(
-        select(Message)
-        .options(joinedload(Message.conversation).selectinload(Conversation.knowledge_bases))
-        .where(Message.role == "assistant", Message.status == "no_answer", Message.created_at >= _range_start(range))
-        .order_by(Message.created_at.desc())
-    ).unique().all()
-    if not is_super_admin(user):
-        messages = [
-            item for item in messages
-            if db.scalar(select(User.user_type).where(User.id == item.conversation.user_id)) != "external"
-            and any(can_access(kb, user, "manage") for kb in item.conversation.knowledge_bases)
-        ]
-    groups = {}
-    for message in messages:
-        parent = db.get(Message, message.parent_message_id)
-        question = parent.content.strip() if parent else "未知问题"
-        key = question.lower()[:100]
-        item = groups.setdefault(key, {"id": key, "question": question, "count": 0, "lastOccurredAt": message.created_at, "status": "open", "suggestedAction": "补充相关文档或调整问题表达"})
-        item["count"] += 1
-        if message.created_at > item["lastOccurredAt"]:
-            item["lastOccurredAt"] = message.created_at
-    items = list(groups.values())
+    if backfill_admin_records(db):
+        db.commit()
+    statement = (
+        select(KnowledgeGap)
+        .where(KnowledgeGap.last_occurred_at >= _range_start(range))
+        .order_by(KnowledgeGap.status, KnowledgeGap.occurrence_count.desc(), KnowledgeGap.last_occurred_at.desc())
+    )
     if status:
-        items = [item for item in items if item["status"] == status]
-    items.sort(key=lambda item: (-item["count"], item["question"]))
-    return paginated(request, items[page.offset : page.offset + page.page_size], page=page.page, page_size=page.page_size, total=len(items))
+        statement = statement.where(KnowledgeGap.status == status)
+    gaps = db.scalars(statement).all()
+    kb_ids = {item.knowledge_base_id for item in gaps}
+    knowledge_bases = {
+        item.id: item
+        for item in db.scalars(
+            select(KnowledgeBase)
+            .options(selectinload(KnowledgeBase.owners), selectinload(KnowledgeBase.acl_entries))
+            .where(KnowledgeBase.id.in_(kb_ids), KnowledgeBase.deleted_at.is_(None))
+        ).unique().all()
+    } if kb_ids else {}
+    visible = [
+        item for item in gaps
+        if item.knowledge_base_id in knowledge_bases
+        and (is_super_admin(user) or can_access(knowledge_bases[item.knowledge_base_id], user, "manage"))
+    ]
+    items = visible[page.offset : page.offset + page.page_size]
+    return paginated(
+        request,
+        [
+            {
+                "id": str(item.id),
+                "question": item.question,
+                "count": item.occurrence_count,
+                "firstOccurredAt": item.first_occurred_at,
+                "lastOccurredAt": item.last_occurred_at,
+                "status": item.status,
+                "statusLabel": "已补充" if item.status == "supplemented" else "待补充",
+                "knowledgeBaseId": str(item.knowledge_base_id),
+                "knowledgeBaseName": knowledge_bases[item.knowledge_base_id].name,
+                "supplementedAt": item.supplemented_at,
+                "supplementNote": item.supplement_note,
+                "suggestedAction": "补充相关文档或调整问题表达",
+            }
+            for item in items
+        ],
+        page=page.page,
+        page_size=page.page_size,
+        total=len(visible),
+    )
+
+
+@admin_router.post("/knowledge-gaps/{gap_id}/supplement", summary="标记知识缺口已补充")
+def supplement_knowledge_gap(
+    gap_id: uuid.UUID,
+    payload: KnowledgeGapSupplement,
+    request: Request,
+    user: User = Depends(require_permissions("qa.analytics")),
+    db: Session = Depends(get_db),
+):
+    gap = db.get(KnowledgeGap, gap_id)
+    if not gap:
+        raise AppError(404, "KNOWLEDGE_GAP_NOT_FOUND", "知识缺口不存在")
+    kb = get_kb_or_404(db, gap.knowledge_base_id)
+    if not is_super_admin(user):
+        ensure_allowed = can_access(kb, user, "manage")
+        if not ensure_allowed:
+            raise AppError(404, "KNOWLEDGE_GAP_NOT_FOUND", "知识缺口不存在")
+    gap.status = "supplemented"
+    gap.supplemented_at = utcnow()
+    gap.supplemented_by = user.id
+    gap.supplement_note = payload.note
+    record_audit(
+        db,
+        actor=user,
+        module="qa",
+        action="knowledge_gap.supplement",
+        target_type="knowledge_gap",
+        target_id=gap.id,
+        request=request,
+        after={"knowledgeBaseId": str(gap.knowledge_base_id), "note": payload.note},
+    )
+    db.commit()
+    return success(
+        request,
+        {"id": str(gap.id), "status": gap.status, "statusLabel": "已补充", "supplementedAt": gap.supplemented_at},
+    )
 
 
 @admin_router.get("/anomalies", summary="异常任务分页")
@@ -189,16 +258,36 @@ def anomalies(
     user: User = Depends(require_permissions("task.read")),
     db: Session = Depends(get_db),
 ):
-    statement = select(ProcessingTask).where(ProcessingTask.status == "failed").order_by(ProcessingTask.created_at.desc())
+    statement = select(ProcessingTask).where(
+        ProcessingTask.status == "failed",
+        ProcessingTask.knowledge_base_id.is_not(None),
+    ).order_by(ProcessingTask.created_at.desc())
     if type:
         statement = statement.where(ProcessingTask.type == type)
     all_items = db.scalars(statement).all()
     if not is_super_admin(user):
         managed_ids = {kb.id for kb in list_accessible(db, user, "manage")}
         all_items = [item for item in all_items if item.knowledge_base_id in managed_ids]
+    kb_ids = {item.knowledge_base_id for item in all_items if item.knowledge_base_id}
+    knowledge_bases = {
+        item.id: item
+        for item in db.scalars(
+            select(KnowledgeBase).where(KnowledgeBase.id.in_(kb_ids), KnowledgeBase.deleted_at.is_(None))
+        ).all()
+    } if kb_ids else {}
+    all_items = [item for item in all_items if item.knowledge_base_id in knowledge_bases]
     total = len(all_items)
     items = all_items[page.offset : page.offset + page.page_size]
-    return paginated(request, [task_payload(item, include_events=False) for item in items], page=page.page, page_size=page.page_size, total=total)
+    return paginated(
+        request,
+        [
+            administrator_failure_payload(item, knowledge_base_name=knowledge_bases[item.knowledge_base_id].name)
+            for item in items
+        ],
+        page=page.page,
+        page_size=page.page_size,
+        total=total,
+    )
 
 
 @admin_router.post("/reports", status_code=202, summary="创建分析报告导出任务")
@@ -223,19 +312,18 @@ def qa_records(
     user: User = Depends(require_permissions("qa.read")),
     db: Session = Depends(get_db),
 ):
+    if backfill_admin_records(db):
+        db.commit()
     statement = (
-        select(Message)
-        .options(
-            joinedload(Message.conversation).selectinload(Conversation.knowledge_bases),
-            selectinload(Message.citations),
-        )
-        .where(Message.role == "assistant")
-        .order_by(Message.created_at.desc())
+        select(QaRecord)
+        .options(selectinload(QaRecord.knowledge_bases))
+        .order_by(QaRecord.created_at.desc())
     )
     if status:
-        statement = statement.where(Message.status == status)
+        statement = statement.where(QaRecord.status == status)
     if q:
-        statement = statement.where(Message.content.ilike(f"%{q}%"))
+        pattern = f"%{q}%"
+        statement = statement.where(or_(QaRecord.question.ilike(pattern), QaRecord.answer.ilike(pattern)))
     super_admin = is_super_admin(user)
     external_user_ids = set(db.scalars(select(User.id).where(User.user_type == "external")).all())
     visible = [
@@ -244,56 +332,132 @@ def qa_records(
         if (
             super_admin
             or (
-                item.conversation.user_id not in external_user_ids
+                item.user_id not in external_user_ids
                 and (
                     _is_admin_account(user)
-                    or any(can_access(kb, user, "manage") for kb in item.conversation.knowledge_bases)
+                    or any(can_access(kb, user, "manage") for kb in item.knowledge_bases)
                 )
             )
         )
     ]
     total = len(visible)
     items = visible[page.offset : page.offset + page.page_size]
-    data = []
-    for item in items:
-        parent = db.get(Message, item.parent_message_id)
-        data.append({"id": str(item.id), "conversationId": str(item.conversation_id), "userId": str(item.conversation.user_id), "question": parent.content if parent else None, "answerPreview": item.content[:240], "status": item.status, "citationCount": len(item.citations), "modelName": item.model_name, "createdAt": item.created_at, "completedAt": item.completed_at})
+    data = [
+        {
+            "id": str(item.id),
+            "conversationId": str(item.source_conversation_id),
+            "userId": str(item.user_id) if item.user_id else None,
+            "question": item.question,
+            "answerPreview": item.answer[:240],
+            "status": item.status,
+            "citationCount": item.citation_count,
+            "modelName": item.model_name,
+            "knowledgeBaseIds": [str(kb.id) for kb in item.knowledge_bases],
+            "knowledgeBaseNames": [kb.name for kb in item.knowledge_bases],
+            "createdAt": item.created_at,
+            "completedAt": item.completed_at,
+            "totalMs": item.total_ms,
+        }
+        for item in items
+    ]
     return paginated(request, data, page=page.page, page_size=page.page_size, total=total)
 
 
-@admin_router.get("/qa-records/{message_id}", summary="完整问答审计详情")
+@admin_router.get("/qa-summaries", summary="问答归档摘要")
+def qa_summaries(
+    request: Request,
+    page: PageParams = Depends(get_page_params),
+    user: User = Depends(require_permissions("qa.read")),
+    db: Session = Depends(get_db),
+):
+    summaries = db.scalars(
+        select(QaArchiveSummary).order_by(QaArchiveSummary.summary_date.desc())
+    ).all()
+    knowledge_bases = {
+        item.id: item
+        for item in db.scalars(
+            select(KnowledgeBase)
+            .options(selectinload(KnowledgeBase.owners), selectinload(KnowledgeBase.acl_entries))
+            .where(KnowledgeBase.deleted_at.is_(None))
+        ).unique().all()
+    }
+    visible = [
+        item for item in summaries
+        if item.knowledge_base_id in knowledge_bases
+        and (is_super_admin(user) or _is_admin_account(user) or can_access(knowledge_bases[item.knowledge_base_id], user, "manage"))
+    ]
+    items = visible[page.offset : page.offset + page.page_size]
+    return paginated(
+        request,
+        [
+            {
+                "id": str(item.id),
+                "date": item.summary_date,
+                "knowledgeBaseId": str(item.knowledge_base_id),
+                "knowledgeBaseName": knowledge_bases[item.knowledge_base_id].name,
+                "questionCount": item.question_count,
+                "answeredCount": item.answered_count,
+                "noAnswerCount": item.no_answer_count,
+                "failedCount": item.failed_count,
+                "helpfulCount": item.helpful_count,
+                "unhelpfulCount": item.unhelpful_count,
+                "averageResponseMs": round(item.response_ms_total / item.response_ms_samples) if item.response_ms_samples else None,
+                "resolvedFeedbackCount": item.resolved_feedback_count,
+                "supplementedGapCount": item.supplemented_gap_count,
+                "topQuestions": item.top_questions,
+                "summary": item.summary_text,
+            }
+            for item in items
+        ],
+        page=page.page,
+        page_size=page.page_size,
+        total=len(visible),
+    )
+
+
+@admin_router.get("/qa-records/{record_id}", summary="完整问答审计详情")
 def qa_record_detail(
-    message_id: uuid.UUID,
+    record_id: uuid.UUID,
     request: Request,
     user: User = Depends(require_permissions("qa.content.read")),
     db: Session = Depends(get_db),
 ):
-    message = db.scalar(
-        select(Message)
-        .options(
-            selectinload(Message.citations),
-            selectinload(Message.events),
-            joinedload(Message.conversation).selectinload(Conversation.knowledge_bases),
-        )
-        .where(Message.id == message_id, Message.role == "assistant")
+    record = db.scalar(
+        select(QaRecord)
+        .options(selectinload(QaRecord.knowledge_bases))
+        .where(QaRecord.id == record_id)
     )
     external_owner = bool(
-        message
-        and db.scalar(select(User.user_type).where(User.id == message.conversation.user_id)) == "external"
+        record
+        and db.scalar(select(User.user_type).where(User.id == record.user_id)) == "external"
     )
-    if not message or (
+    if not record or (
         external_owner
         and not is_super_admin(user)
     ) or (
         not external_owner
         and not _is_admin_account(user)
-        and not any(can_access(kb, user, "manage") for kb in message.conversation.knowledge_bases)
+        and not any(can_access(kb, user, "manage") for kb in record.knowledge_bases)
     ):
         raise AppError(404, "QA_RECORD_NOT_FOUND", "问答记录不存在")
-    parent = db.get(Message, message.parent_message_id)
-    record_audit(db, actor=user, module="qa", action="content.read", target_type="message", target_id=message.id, request=request)
+    record_audit(db, actor=user, module="qa", action="content.read", target_type="qa_record", target_id=record.id, request=request)
     db.commit()
-    return success(request, {"question": message_payload(parent) if parent else None, "answer": message_payload(message), "events": [{"sequence": event.sequence, "type": event.event_type, "data": event.payload, "occurredAt": event.occurred_at} for event in message.events]})
+    return success(
+        request,
+        {
+            "question": {"content": record.question, "createdAt": record.created_at},
+            "answer": {
+                "content": record.answer,
+                "status": record.status,
+                "modelName": record.model_name,
+                "timing": {"totalMs": record.total_ms},
+                "citationCount": record.citation_count,
+                "completedAt": record.completed_at,
+            },
+            "knowledgeBases": [{"id": str(kb.id), "name": kb.name} for kb in record.knowledge_bases],
+            "events": [],
+        },
+    )
 
 
 @admin_router.get("/feedbacks", summary="反馈分页")

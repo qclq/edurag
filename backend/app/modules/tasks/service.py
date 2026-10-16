@@ -14,6 +14,12 @@ from app.modules.tasks.models import ProcessingTask, TaskEvent
 
 
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "partial_success"}
+TASK_TYPE_LABELS = {
+    "document_ingest": "文档入库",
+    "document_reprocess": "文档重新处理",
+    "knowledge_base_rebuild": "知识库索引重建",
+    "user_import": "用户批量导入",
+}
 
 
 def task_payload(task: ProcessingTask, *, include_events: bool = True) -> dict[str, Any]:
@@ -40,6 +46,41 @@ def task_payload(task: ProcessingTask, *, include_events: bool = True) -> dict[s
     if include_events:
         data["events"] = [event_payload(event) for event in task.events]
     return data
+
+
+def administrator_failure_payload(task: ProcessingTask, *, knowledge_base_name: str) -> dict[str, Any]:
+    """Return a non-technical explanation suitable for operational administrators."""
+    raw = f"{task.error_code or ''} {task.error_message or ''}".lower()
+    type_label = TASK_TYPE_LABELS.get(task.type, "后台处理")
+    if any(marker in raw for marker in ("foreign key", "23503", "still referenced", "外键")):
+        message = "系统发现相关内容仍被现有问答引用，为避免影响已产生的结果，本次更新已安全停止。"
+        action = "请稍后重试；如果持续出现，可先保留旧版本并联系技术支持。"
+    elif any(marker in raw for marker in ("embedding", "milvus", "vector", "向量")):
+        message = "知识索引服务暂时未能完成处理，原始文档仍然保留。"
+        action = "请检查服务状态后重试该任务，或联系技术支持。"
+    elif any(marker in raw for marker in ("timeout", "timed out", "超时", "connection")):
+        message = "处理过程中连接超时，系统没有完成本次操作。"
+        action = "建议稍后重试；多次失败时请联系技术支持。"
+    elif any(marker in raw for marker in ("pdf", "docx", "parse", "解析")):
+        message = "系统未能读取或解析该文档，可能是文件损坏或格式不受支持。"
+        action = "请确认文件可以正常打开，并重新上传常用格式的文件。"
+    else:
+        message = "系统未能完成本次后台处理，相关原始数据没有被删除。"
+        action = "请尝试重新执行；如果仍然失败，请将参考编号提供给技术支持。"
+    return {
+        "id": str(task.id),
+        "referenceNo": task.task_no,
+        "type": task.type,
+        "typeLabel": type_label,
+        "knowledgeBaseId": str(task.knowledge_base_id) if task.knowledge_base_id else None,
+        "knowledgeBaseName": knowledge_base_name,
+        "status": task.status,
+        "title": f"{type_label}未完成",
+        "message": message,
+        "suggestedAction": action,
+        "createdAt": task.created_at,
+        "completedAt": task.completed_at,
+    }
 
 
 def event_payload(event: TaskEvent) -> dict[str, Any]:

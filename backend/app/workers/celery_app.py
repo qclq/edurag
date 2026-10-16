@@ -15,4 +15,10 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_reject_on_worker_lost=True,
     imports=("app.workers.document_pipeline", "app.workers.answer_generation", "app.workers.maintenance"),
+    beat_schedule={
+        "admin-record-retention-hourly": {
+            "task": "edurag.retain_admin_records",
+            "schedule": 3600.0,
+        },
+    },
 )

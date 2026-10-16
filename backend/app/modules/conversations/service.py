@@ -23,6 +23,7 @@ from app.modules.conversations.schemas import MessageCreate, RatingUpdate
 from app.modules.feedback.models import Feedback
 from app.modules.knowledge_bases.models import KnowledgeBase
 from app.modules.knowledge_bases.service import can_access, get_kb_or_404, list_accessible
+from app.modules.operations.retention import capture_qa_record
 from app.modules.rag.service import retrieve_queries
 from app.modules.users.models import User
 
@@ -317,6 +318,7 @@ def generate_message(db: Session, assistant: Message, user: User, settings: Sett
             {"items": ["这项规定适用于哪些人？", "需要准备哪些材料？", "相关文件何时生效？"]},
         )
         db.flush()
+        capture_qa_record(db, assistant=assistant, question=question, conversation=conversation)
         append_message_event(db, assistant, "completed", {"message": message_payload(assistant), "retrieval": summary})
         db.commit()
     except Exception as exc:
@@ -334,6 +336,14 @@ def generate_message(db: Session, assistant: Message, user: User, settings: Sett
             db, assistant, "error",
             {"messageId": str(assistant.id), "code": code, "message": assistant.error_message, "retryable": True},
         )
+        question = db.get(Message, assistant.parent_message_id)
+        conversation = db.scalar(
+            select(Conversation)
+            .options(selectinload(Conversation.knowledge_bases))
+            .where(Conversation.id == assistant.conversation_id)
+        )
+        if question and conversation:
+            capture_qa_record(db, assistant=assistant, question=question, conversation=conversation)
         db.commit()
 
 

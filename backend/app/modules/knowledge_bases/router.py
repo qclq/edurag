@@ -30,6 +30,7 @@ from app.modules.knowledge_bases.service import (
     update_knowledge_base,
 )
 from app.modules.operations.service import record_audit
+from app.modules.operations.retention import purge_knowledge_base_operations
 from app.modules.rag.service import retrieve
 from app.modules.tasks.service import create_task, task_payload
 from app.modules.users.models import User
@@ -146,9 +147,19 @@ def delete_knowledge_base(
     ensure_access(kb, user, "manage")
     if payload.confirm_name != kb.name:
         raise AppError(400, "CONFIRMATION_MISMATCH", "确认名称与知识库名称不一致")
+    cleanup = purge_knowledge_base_operations(db, kb.id)
     kb.deleted_at = utcnow()
     kb.status = "disabled"
-    record_audit(db, actor=user, module="knowledge_base", action="delete", target_type="knowledge_base", target_id=kb.id, request=request)
+    record_audit(
+        db,
+        actor=user,
+        module="knowledge_base",
+        action="delete",
+        target_type="knowledge_base",
+        target_id=kb.id,
+        request=request,
+        after={"operationalRecordsRemoved": cleanup},
+    )
     db.commit()
     return Response(status_code=204)
 

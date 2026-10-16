@@ -58,6 +58,8 @@ class Settings(BaseSettings):
 
     task_dispatch_mode: Literal["celery", "inline"] = "celery"
     task_event_poll_seconds: float = 1.0
+    admin_record_retention_hours: int = 72
+    admin_record_cleanup_batch_size: int = 1000
 
     milvus_enabled: bool = True
     milvus_uri: str = "http://localhost:19530"

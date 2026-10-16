@@ -7,6 +7,7 @@ from sqlalchemy import select
 from app.core.config import Settings, get_settings
 from app.db.session import SessionLocal
 from app.modules.documents.models import Document, DocumentVersion
+from app.modules.operations.retention import run_admin_record_retention
 from app.modules.tasks.models import ProcessingTask
 from app.modules.tasks.service import create_task, get_task_or_404, update_task
 from app.workers.document_pipeline import run_document_pipeline
@@ -87,12 +88,22 @@ def dispatch_knowledge_base_rebuild(task_id: str, settings: Settings) -> None:
     rebuild_knowledge_base.delay(task_id)
 
 
+def run_scheduled_admin_record_retention(settings: Settings | None = None) -> dict[str, int]:
+    settings = settings or get_settings()
+    with SessionLocal() as db:
+        return run_admin_record_retention(db, settings)
+
+
 try:
     from app.workers.celery_app import celery_app
 
     @celery_app.task(name="edurag.rebuild_knowledge_base", autoretry_for=(), max_retries=0)
     def rebuild_knowledge_base(task_id: str) -> None:
         run_knowledge_base_rebuild(task_id)
+
+    @celery_app.task(name="edurag.retain_admin_records", autoretry_for=(), max_retries=0)
+    def retain_admin_records() -> dict[str, int]:
+        return run_scheduled_admin_record_retention()
 except ImportError:
     class _UnavailableTask:
         def delay(self, task_id: str) -> None:

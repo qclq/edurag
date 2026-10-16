@@ -17,6 +17,10 @@ class SettingsUpdate(ApiModel):
     version: int = Field(ge=1)
 
 
+class KnowledgeGapSupplement(ApiModel):
+    note: str | None = Field(default=None, max_length=1000)
+
+
 class UserCreate(ApiModel):
     name: str = Field(min_length=1, max_length=100)
     account: str | None = Field(default=None, min_length=2, max_length=100)
