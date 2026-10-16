@@ -1,8 +1,9 @@
+import keyword
 import re
 import uuid
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from app.core.schemas import ApiModel
 
@@ -45,7 +46,7 @@ class RetrievalConfig(ApiModel):
 
 class KnowledgeBaseCreate(ApiModel):
     name: str = Field(min_length=1, max_length=200)
-    code: str = Field(min_length=2, max_length=80)
+    code: str | None = Field(default=None, max_length=80)
     description: str | None = Field(default=None, max_length=5000)
     department_id: uuid.UUID | None = None
     business_category: str | None = Field(default=None, max_length=100)
@@ -54,12 +55,15 @@ class KnowledgeBaseCreate(ApiModel):
     acl: list[AclEntryInput] = Field(default_factory=list)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
 
-    @model_validator(mode="after")
-    def normalize_code(self):
-        self.code = self.code.strip().upper()
-        if not re.fullmatch(r"[A-Z][A-Z0-9_-]+", self.code):
-            raise ValueError("code 只能使用大写字母、数字、下划线和短横线")
-        return self
+    @field_validator("code")
+    @classmethod
+    def validate_legacy_code(cls, value: str | None):
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if not re.fullmatch(r"[a-z_][a-z0-9_]*", normalized) or keyword.iskeyword(normalized):
+            raise ValueError("code 必须是仅含英文字母、数字和下划线的有效 Python 标识符")
+        return normalized
 
 
 class KnowledgeBaseUpdate(ApiModel):

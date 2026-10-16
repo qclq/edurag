@@ -82,7 +82,9 @@ def post_knowledge_base(
     db: Session = Depends(get_db),
 ):
     kb = create_knowledge_base(db, user, payload)
-    record_audit(db, actor=user, module="knowledge_base", action="create", target_type="knowledge_base", target_id=kb.id, request=request, after=payload.model_dump())
+    audit_payload = payload.model_dump()
+    audit_payload["code"] = kb.code
+    record_audit(db, actor=user, module="knowledge_base", action="create", target_type="knowledge_base", target_id=kb.id, request=request, after=audit_payload)
     db.commit()
     kb = get_kb_or_404(db, kb.id)
     return success(request, knowledge_base_payload(db, kb, detailed=True), status_code=201)

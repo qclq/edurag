@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import keyword
+import re
 import uuid
 from typing import Any
 
+from pypinyin import Style, lazy_pinyin
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
@@ -21,6 +24,33 @@ ACTION_COLUMN = {
     "download": "can_download",
     "manage": "can_manage",
 }
+
+KNOWLEDGE_BASE_CODE_MAX_LENGTH = 80
+
+
+def knowledge_base_code_from_name(name: str) -> str:
+    """Convert a display name to a lowercase, ASCII Python identifier."""
+    transliterated = "_".join(lazy_pinyin(name.strip(), style=Style.NORMAL))
+    code = re.sub(r"[^a-zA-Z0-9_]+", "_", transliterated).strip("_").lower()
+    code = re.sub(r"_+", "_", code)
+    if not code:
+        code = "knowledge_base"
+    if code[0].isdigit():
+        code = f"kb_{code}"
+    if keyword.iskeyword(code):
+        code = f"{code}_kb"
+    return code[:KNOWLEDGE_BASE_CODE_MAX_LENGTH].rstrip("_")
+
+
+def _unique_knowledge_base_code(db: Session, name: str) -> str:
+    base = knowledge_base_code_from_name(name)
+    candidate = base
+    suffix_number = 2
+    while db.scalar(select(KnowledgeBase.id).where(func.lower(KnowledgeBase.code) == candidate.lower())):
+        suffix = f"_{suffix_number}"
+        candidate = f"{base[:KNOWLEDGE_BASE_CODE_MAX_LENGTH - len(suffix)].rstrip('_')}{suffix}"
+        suffix_number += 1
+    return candidate
 
 
 def _subject_matches(entry: KnowledgeBaseAclEntry, user: User) -> bool:
@@ -149,7 +179,7 @@ def _new_acl(kb: KnowledgeBase, item: AclEntryInput) -> KnowledgeBaseAclEntry:
 def create_knowledge_base(db: Session, user: User, payload: KnowledgeBaseCreate) -> KnowledgeBase:
     retrieval = payload.retrieval
     kb = KnowledgeBase(
-        code=payload.code,
+        code=payload.code or _unique_knowledge_base_code(db, payload.name),
         name=payload.name,
         description=payload.description,
         department_id=payload.department_id,

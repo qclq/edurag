@@ -9,6 +9,7 @@ from app.integrations.embedding.provider import embed_texts
 from app.integrations.llm.provider import generate_answer, plan_retrieval_queries
 from app.modules.documents.models import Document, DocumentChunk, DocumentVersion, StoredFile
 from app.modules.knowledge_bases.models import KnowledgeBase
+from app.modules.knowledge_bases.service import knowledge_base_code_from_name
 from app.modules.users.models import Permission, Role, User
 from conftest import captcha_value, login
 
@@ -48,8 +49,8 @@ def create_kb(client, headers):
         headers=headers,
         json={
             "name": "教务制度库",
-            "code": "ACADEMIC_RULES",
             "description": "测试知识库",
+            "businessCategory": "规章制度",
             "acl": [{"isPublic": True, "canSearch": True, "canPreview": True}],
             "retrieval": {
                 "chunkSize": 500,
@@ -65,6 +66,27 @@ def create_kb(client, headers):
     return response.json()["data"]
 
 
+def test_knowledge_base_code_generation_uses_python_identifiers():
+    assert knowledge_base_code_from_name("学生事务与奖助政策") == "xue_sheng_shi_wu_yu_jiang_zhu_zheng_ce"
+    assert knowledge_base_code_from_name("Student Policy 2026") == "student_policy_2026"
+    assert knowledge_base_code_from_name("2026 招生") == "kb_2026_zhao_sheng"
+    assert knowledge_base_code_from_name("class") == "class_kb"
+    assert knowledge_base_code_from_name("🎓") == "knowledge_base"
+
+
+def test_knowledge_base_code_generation_resolves_duplicates(test_context):
+    client, _, _ = test_context
+    headers = auth_headers(client)
+
+    first = client.post("/api/v1/admin/knowledge-bases", headers=headers, json={"name": "学生政策"})
+    second = client.post("/api/v1/admin/knowledge-bases", headers=headers, json={"name": "学生政策"})
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    assert first.json()["data"]["code"] == "xue_sheng_zheng_ce"
+    assert second.json()["data"]["code"] == "xue_sheng_zheng_ce_2"
+
+
 def test_knowledge_base_and_draft_ingestion_flow(test_context):
     client, _, _ = test_context
     headers = auth_headers(client)
@@ -75,7 +97,8 @@ def test_knowledge_base_and_draft_ingestion_flow(test_context):
 
     options = client.get("/api/v1/knowledge-bases/options", headers=headers)
     assert options.status_code == 200
-    assert options.json()["data"][0]["code"] == "ACADEMIC_RULES"
+    assert options.json()["data"][0]["code"] == "jiao_wu_zhi_du_ku"
+    assert options.json()["data"][0]["category"] == "规章制度"
 
     upload = client.post(
         "/api/v1/admin/uploads",

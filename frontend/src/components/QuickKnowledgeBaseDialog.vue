@@ -1,6 +1,7 @@
 <script setup>
 import { reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
+import { KNOWLEDGE_BASE_CATEGORIES } from '../constants/knowledgeBases'
 import { authenticatedRequest, useAuth } from '../stores/auth'
 
 const props = defineProps({
@@ -23,14 +24,11 @@ const create = async () => {
   if (!name) return ElMessage.warning('请输入知识库名称')
   saving.value = true
   try {
-    const code = `KB-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
     const created = await authenticatedRequest('/admin/knowledge-bases', {
       method: 'POST',
       body: {
         name,
-        code,
         description: form.description.trim() || null,
-        departmentId: null,
         businessCategory: form.businessCategory || null,
         selectable: true,
         ownerIds: state.user?.id ? [state.user.id] : [],
@@ -70,10 +68,7 @@ const create = async () => {
       </el-form-item>
       <el-form-item label="业务分类">
         <el-select v-model="form.businessCategory" style="width:100%">
-          <el-option label="规章制度" value="规章制度" />
-          <el-option label="办事指南" value="办事指南" />
-          <el-option label="通知公告" value="通知公告" />
-          <el-option label="综合资料" value="综合资料" />
+          <el-option v-for="category in KNOWLEDGE_BASE_CATEGORIES" :key="category" :label="category" :value="category" />
         </el-select>
       </el-form-item>
       <el-form-item label="说明">
