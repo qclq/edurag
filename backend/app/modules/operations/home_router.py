@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import PageParams, get_current_user, get_page_params
 from app.core.config import Settings, get_settings
-from app.core.errors import paginated, success
+from app.core.errors import AppError, paginated, success
 from app.db.session import get_db
 from app.modules.conversations.models import Conversation
 from app.modules.documents.models import Document, DocumentVersion
@@ -114,6 +114,8 @@ def global_search(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    if user.user_type == "external":
+        raise AppError(403, "EXTERNAL_SEARCH_FORBIDDEN", "外部人员账号仅开放首页问答")
     results = []
     kbs = list_accessible(db, user, "search")
     if type in {None, "knowledge_base"}:

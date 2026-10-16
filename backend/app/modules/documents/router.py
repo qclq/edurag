@@ -260,12 +260,26 @@ def reprocess_document(
     current = next((item for item in document.versions if item.id == document.current_version_id), None) or next((item for item in document.versions if item.is_current), None)
     if not current:
         raise AppError(409, "DOCUMENT_VERSION_MISSING", "文档没有可重新处理的版本")
-    current.ocr_enabled = payload.ocr_enabled
-    current.chunk_size = payload.chunk_size
-    current.chunk_overlap = payload.chunk_overlap
-    current.process_status = "pending"
-    task, _ = create_task(db, type="document_reprocess", created_by=user.id, knowledge_base_id=document.knowledge_base_id, document_id=document.id, document_version_id=current.id, idempotency_key=idempotency_key, progress_text="等待重新处理")
-    record_audit(db, actor=user, module="document", action="reprocess", target_type="document", target_id=document.id, request=request, after=payload.model_dump())
+    # Reprocessing in place would delete the current chunks, but historical
+    # answer citations intentionally keep foreign keys to those chunks. Build a
+    # new version from the same source file and switch only after it is ready.
+    # This preserves old citations and leaves the current searchable version
+    # untouched if reprocessing fails.
+    replacement = DocumentVersion(
+        document_id=document.id,
+        version_no=max((item.version_no for item in document.versions), default=0) + 1,
+        file_id=current.file_id,
+        is_current=False,
+        process_status="pending",
+        ocr_enabled=payload.ocr_enabled,
+        chunk_size=payload.chunk_size,
+        chunk_overlap=payload.chunk_overlap,
+    )
+    db.add(replacement)
+    db.flush()
+    task, _ = create_task(db, type="document_reprocess", created_by=user.id, knowledge_base_id=document.knowledge_base_id, document_id=document.id, document_version_id=replacement.id, idempotency_key=idempotency_key, progress_text="等待重新处理")
+    audit_payload = payload.model_dump() | {"sourceVersionId": str(current.id), "newVersionId": str(replacement.id)}
+    record_audit(db, actor=user, module="document", action="reprocess", target_type="document", target_id=document.id, request=request, after=audit_payload)
     db.commit()
     if settings.environment != "test":
         try:

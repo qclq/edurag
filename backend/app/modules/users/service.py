@@ -1,11 +1,92 @@
+import re
+import uuid
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import Settings
 from app.core.errors import AppError
 from app.core.security import hash_password, utcnow, verify_password
+from app.integrations.storage import get_storage
 from app.modules.auth.models import AuthSession, LoginEvent
 from app.modules.users.models import User
 from app.modules.users.schemas import PasswordChange, ProfileUpdate
+
+
+AVATAR_MAX_BYTES = 2 * 1024 * 1024
+AVATAR_FILE_PATTERN = re.compile(r"^[0-9a-f]{32}\.(jpg|png|webp)$")
+AVATAR_MIME_TYPES = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+
+
+def _detect_avatar(content: bytes) -> tuple[str, str]:
+    if content.startswith(b"\xff\xd8\xff"):
+        return "jpg", AVATAR_MIME_TYPES["jpg"]
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png", AVATAR_MIME_TYPES["png"]
+    if len(content) >= 12 and content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+        return "webp", AVATAR_MIME_TYPES["webp"]
+    raise AppError(415, "AVATAR_TYPE_UNSUPPORTED", "头像仅支持 JPG、PNG 或 WebP 图片")
+
+
+def avatar_storage_details(user_id: uuid.UUID, file_name: str) -> tuple[str, str]:
+    match = AVATAR_FILE_PATTERN.fullmatch(file_name)
+    if not match:
+        raise AppError(404, "AVATAR_NOT_FOUND", "头像不存在")
+    extension = match.group(1)
+    return f"avatars/{user_id}/{file_name}", AVATAR_MIME_TYPES[extension]
+
+
+def _stored_avatar_key(avatar_url: str | None, user_id: uuid.UUID, settings: Settings) -> str | None:
+    prefix = f"{settings.api_prefix}/me/avatars/{user_id}/"
+    if not avatar_url or not avatar_url.startswith(prefix):
+        return None
+    file_name = avatar_url.removeprefix(prefix)
+    try:
+        key, _ = avatar_storage_details(user_id, file_name)
+        return key
+    except AppError:
+        return None
+
+
+def save_avatar(db: Session, user: User, content: bytes, settings: Settings) -> User:
+    if user.user_type == "external":
+        raise AppError(403, "EXTERNAL_PROFILE_UPDATE_FORBIDDEN", "外部人员不能修改共享访客头像")
+    if not content:
+        raise AppError(400, "AVATAR_EMPTY", "请选择头像图片")
+    if len(content) > AVATAR_MAX_BYTES:
+        raise AppError(413, "AVATAR_TOO_LARGE", "头像图片不能超过 2 MB")
+    extension, mime_type = _detect_avatar(content)
+    file_name = f"{uuid.uuid4().hex}.{extension}"
+    storage_key, _ = avatar_storage_details(user.id, file_name)
+    storage = get_storage(settings)
+    storage.put(storage_key, content, mime_type)
+    old_storage_key = _stored_avatar_key(user.avatar_url, user.id, settings)
+    user.avatar_url = f"{settings.api_prefix}/me/avatars/{user.id}/{file_name}"
+    user.row_version += 1
+    db.commit()
+    db.refresh(user)
+    if old_storage_key:
+        try:
+            storage.delete(old_storage_key)
+        except OSError:
+            pass
+    return user
+
+
+def remove_avatar(db: Session, user: User, settings: Settings) -> User:
+    if user.user_type == "external":
+        raise AppError(403, "EXTERNAL_PROFILE_UPDATE_FORBIDDEN", "外部人员不能修改共享访客头像")
+    old_storage_key = _stored_avatar_key(user.avatar_url, user.id, settings)
+    user.avatar_url = None
+    user.row_version += 1
+    db.commit()
+    db.refresh(user)
+    if old_storage_key:
+        try:
+            get_storage(settings).delete(old_storage_key)
+        except OSError:
+            pass
+    return user
 
 
 def mask_email(value: str | None) -> str | None:
@@ -59,6 +140,7 @@ def user_payload(user: User, db: Session) -> dict[str, object]:
         "avatarUrl": user.avatar_url,
         "status": user.status,
         "authSource": user.auth_source,
+        "mustChangePassword": user.must_change_password,
         "roles": role_items,
         "permissions": permissions,
         "managementScopes": {"departmentIds": [], "knowledgeBaseIds": []},
@@ -85,6 +167,8 @@ def user_payload(user: User, db: Session) -> dict[str, object]:
 
 def update_profile(db: Session, user: User, payload: ProfileUpdate) -> User:
     supplied = payload.model_fields_set
+    if user.user_type == "external" and "avatar_url" in supplied:
+        raise AppError(403, "EXTERNAL_PROFILE_UPDATE_FORBIDDEN", "外部人员不能修改共享访客头像")
     synchronized_fields = supplied.intersection({"email", "phone"})
     if user.auth_source != "local" and synchronized_fields:
         raise AppError(
@@ -105,15 +189,23 @@ def update_profile(db: Session, user: User, payload: ProfileUpdate) -> User:
     return user
 
 
-def change_password(db: Session, user: User, payload: PasswordChange) -> None:
+def change_password(
+    db: Session,
+    user: User,
+    payload: PasswordChange,
+    *,
+    current_session: AuthSession,
+) -> None:
     if user.auth_source != "local" or not user.password_hash:
         raise AppError(409, "AUTH_PASSWORD_MANAGED_EXTERNALLY", "该账号密码由统一身份认证平台管理")
-    if not verify_password(payload.old_password, user.password_hash):
+    if not user.must_change_password and (
+        not payload.old_password or not verify_password(payload.old_password, user.password_hash)
+    ):
         raise AppError(
             400,
             "AUTH_OLD_PASSWORD_INVALID",
-            "原密码不正确",
-            field_errors={"oldPassword": "原密码不正确"},
+            "请输入正确的当前密码",
+            field_errors={"oldPassword": "请输入正确的当前密码"},
         )
     if verify_password(payload.new_password, user.password_hash):
         raise AppError(
@@ -123,12 +215,15 @@ def change_password(db: Session, user: User, payload: PasswordChange) -> None:
             field_errors={"newPassword": "请使用不同的新密码"},
         )
     user.password_hash = hash_password(payload.new_password)
+    user.must_change_password = False
     user.row_version += 1
     now = utcnow()
     sessions = db.scalars(
         select(AuthSession).where(AuthSession.user_id == user.id, AuthSession.revoked_at.is_(None))
     ).all()
     for auth_session in sessions:
+        if auth_session.id == current_session.id:
+            continue
         auth_session.revoked_at = now
         auth_session.revoked_reason = "password_changed"
     db.commit()

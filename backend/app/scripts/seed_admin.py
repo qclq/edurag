@@ -49,6 +49,14 @@ PERMISSION_CODES = (
     "audit.read",
 )
 
+USER_ACCOUNT_MANAGEMENT_PERMISSION_CODES = frozenset(
+    code for code in PERMISSION_CODES if code.startswith("user.")
+) | {"role.assign"}
+
+KNOWLEDGE_ADMIN_PERMISSION_CODES = tuple(
+    code for code in PERMISSION_CODES if code not in USER_ACCOUNT_MANAGEMENT_PERMISSION_CODES
+)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create the initial EduRAG super administrator")
@@ -77,6 +85,23 @@ def main() -> None:
             role = Role(code="super_admin", name="超级管理员", is_system=True)
             db.add(role)
         role.permissions = permissions
+        knowledge_admin = db.scalar(select(Role).where(Role.code == "knowledge_admin"))
+        if knowledge_admin is None:
+            knowledge_admin = Role(
+                code="knowledge_admin",
+                name="管理员",
+                description="可使用全部管理能力，但不能管理用户账户信息",
+                is_system=True,
+            )
+            db.add(knowledge_admin)
+        else:
+            knowledge_admin.name = "管理员"
+            knowledge_admin.description = "可使用全部管理能力，但不能管理用户账户信息"
+        knowledge_admin.permissions = [
+            permission
+            for permission in permissions
+            if permission.code in KNOWLEDGE_ADMIN_PERMISSION_CODES
+        ]
         db.add(
             User(
                 account=args.account.lower(),

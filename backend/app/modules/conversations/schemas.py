@@ -7,7 +7,7 @@ from app.core.schemas import ApiModel
 
 
 class ConversationCreate(ApiModel):
-    knowledge_base_ids: list[uuid.UUID] = Field(min_length=1, max_length=20)
+    knowledge_base_ids: list[uuid.UUID] = Field(default_factory=list, max_length=20)
     title: str | None = Field(default=None, max_length=300)
 
 

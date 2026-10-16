@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, joinedload, selectinload
 from app.core.config import Settings
 from app.core.errors import AppError
 from app.core.security import utcnow
-from app.integrations.llm import stream_answer
+from app.integrations.llm import LlmProviderError, plan_retrieval_queries, stream_answer
 from app.modules.conversations.models import (
     Conversation,
     Message,
@@ -22,8 +22,8 @@ from app.modules.conversations.models import (
 from app.modules.conversations.schemas import MessageCreate, RatingUpdate
 from app.modules.feedback.models import Feedback
 from app.modules.knowledge_bases.models import KnowledgeBase
-from app.modules.knowledge_bases.service import can_access, get_kb_or_404
-from app.modules.rag.service import retrieve
+from app.modules.knowledge_bases.service import can_access, get_kb_or_404, list_accessible
+from app.modules.rag.service import retrieve_queries
 from app.modules.users.models import User
 
 
@@ -112,14 +112,19 @@ def get_conversation_or_404(db: Session, conversation_id, user: User) -> Convers
     return conversation
 
 
-def create_conversation(db: Session, user: User, knowledge_base_ids: list, title: str | None) -> Conversation:
-    unique_ids = list(dict.fromkeys(knowledge_base_ids))
+def create_conversation(db: Session, user: User, knowledge_base_ids: list | None, title: str | None) -> Conversation:
+    unique_ids = list(dict.fromkeys(knowledge_base_ids or []))
     kbs = []
-    for kb_id in unique_ids:
-        kb = get_kb_or_404(db, kb_id)
-        if not can_access(kb, user, "search") or kb.status != "enabled":
-            raise AppError(404, "KNOWLEDGE_BASE_NOT_FOUND", "知识库不存在")
-        kbs.append(kb)
+    if unique_ids:
+        for kb_id in unique_ids:
+            kb = get_kb_or_404(db, kb_id)
+            if not can_access(kb, user, "search") or kb.status != "enabled":
+                raise AppError(404, "KNOWLEDGE_BASE_NOT_FOUND", "知识库不存在")
+            kbs.append(kb)
+    else:
+        kbs = list_accessible(db, user, "search")
+    if not kbs:
+        raise AppError(409, "NO_ACCESSIBLE_KNOWLEDGE_BASE", "当前账号没有可检索的知识库")
     conversation = Conversation(user_id=user.id, title=title or "新对话", knowledge_bases=kbs)
     db.add(conversation)
     db.flush()
@@ -218,18 +223,48 @@ def generate_message(db: Session, assistant: Message, user: User, settings: Sett
         assistant.status = "retrieving"
         append_message_event(
             db, assistant, "stage",
-            {"messageId": str(assistant.id), "status": "retrieving", "stage": "retrieval", "label": "正在检索知识库"},
+            {"messageId": str(assistant.id), "status": "retrieving", "stage": "planning", "label": "正在拆解检索问题"},
         )
         db.commit()
-        chunks, summary = retrieve(
+
+        planning_started = time.perf_counter()
+        planner_fallback = False
+        try:
+            retrieval_queries = plan_retrieval_queries(question.content, settings)
+        except LlmProviderError:
+            retrieval_queries = [question.content]
+            planner_fallback = True
+        planning_ms = int((time.perf_counter() - planning_started) * 1000)
+        accessible_kbs = list_accessible(db, user, "search")
+        if not accessible_kbs:
+            raise AppError(409, "NO_ACCESSIBLE_KNOWLEDGE_BASE", "当前账号没有可检索的知识库")
+        conversation.knowledge_bases = accessible_kbs
+        append_message_event(
+            db, assistant, "stage",
+            {
+                "messageId": str(assistant.id),
+                "status": "retrieving",
+                "stage": "retrieval",
+                "label": f"正在执行 {len(retrieval_queries)} 条检索查询",
+                "queries": retrieval_queries,
+            },
+        )
+        db.commit()
+        chunks, summary = retrieve_queries(
             db,
             user,
-            question.content,
+            retrieval_queries,
             settings,
-            knowledge_base_ids=[kb.id for kb in conversation.knowledge_bases],
-            top_k=max((kb.top_k for kb in conversation.knowledge_bases), default=5),
-            min_score=min((kb.similarity_threshold for kb in conversation.knowledge_bases), default=0.55),
+            knowledge_base_ids=None,
+            top_k=max(8, max((kb.top_k for kb in accessible_kbs), default=5)),
+            # Qwen dense scores around 0.35 can still be strong matches after
+            # query decomposition. Keep stricter KB thresholds for diagnostics,
+            # but cap the automatic cross-KB gate so useful evidence reaches the
+            # answer model, which still has to ground every conclusion in citations.
+            min_score=min(0.35, min((kb.similarity_threshold for kb in accessible_kbs), default=0.35)),
         )
+        summary["planningMs"] = planning_ms
+        summary["plannerFallback"] = planner_fallback
         assistant.retrieval_ms = summary["retrievalMs"]
         assistant.status = "generating"
         append_message_event(

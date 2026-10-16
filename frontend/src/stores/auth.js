@@ -14,6 +14,9 @@ let refreshPromise = null
 
 export const isAuthenticated = computed(() => Boolean(state.accessToken && state.user))
 export const canAccessAdmin = computed(() => Boolean(state.user?.canAccessAdmin))
+export const isSuperAdmin = computed(() => Boolean(state.user?.roles?.some(role => role.code === 'super_admin')))
+export const mustChangePassword = computed(() => Boolean(state.user?.mustChangePassword))
+export const isExternalUser = computed(() => state.user?.userType === 'external')
 
 export async function loadBootstrap({ force = false } = {}) {
   if (state.bootstrapLoaded && !force) return state.bootstrap
@@ -42,8 +45,11 @@ export async function login(credentials) {
   return result.user
 }
 
-export async function completeSsoLogin() {
-  return refreshSession()
+export async function externalAccess() {
+  const result = await apiRequest('/auth/external-access', { method: 'POST' })
+  state.accessToken = result.accessToken
+  state.user = result.user
+  return result.user
 }
 
 async function refreshSession() {
@@ -76,6 +82,18 @@ export async function restoreSession() {
 export async function fetchCurrentUser() {
   if (!state.accessToken) return null
   state.user = await authenticatedRequest('/auth/me')
+  return state.user
+}
+
+export async function uploadCurrentUserAvatar(file) {
+  const body = new FormData()
+  body.append('file', file)
+  state.user = await authenticatedRequest('/me/avatar', { method: 'POST', body })
+  return state.user
+}
+
+export async function removeCurrentUserAvatar() {
+  state.user = await authenticatedRequest('/me/avatar', { method: 'DELETE' })
   return state.user
 }
 
@@ -148,5 +166,8 @@ export function useAuth() {
     state: readonly(state),
     isAuthenticated,
     canAccessAdmin,
+    isSuperAdmin,
+    mustChangePassword,
+    isExternalUser,
   }
 }

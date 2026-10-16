@@ -12,7 +12,7 @@ from app.core.security import hash_password
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
-from app.scripts.seed_admin import PERMISSION_CODES
+from app.scripts.seed_admin import KNOWLEDGE_ADMIN_PERMISSION_CODES, PERMISSION_CODES
 from app.modules.auth import models as auth_models  # noqa: F401
 from app.modules.users.models import Department, Permission, Role, User
 
@@ -55,8 +55,18 @@ def test_context(tmp_path):
             Permission(code=code, name=code, module=code.split(".", 1)[0])
             for code in PERMISSION_CODES
         ]
+        db.add_all(permissions)
         normal = Role(code="normal_user", name="普通用户", is_system=True)
-        admin = Role(code="knowledge_admin", name="知识库管理员", is_system=True, permissions=permissions)
+        admin = Role(
+            code="knowledge_admin",
+            name="管理员",
+            is_system=True,
+            permissions=[
+                permission
+                for permission in permissions
+                if permission.code in KNOWLEDGE_ADMIN_PERMISSION_CODES
+            ],
+        )
         user = User(
             account="2026000001",
             password_hash=hash_password("OldPassword!123"),
@@ -91,12 +101,12 @@ def captcha_value(client: TestClient) -> tuple[str, str]:
     return data["captchaId"], code
 
 
-def login(client: TestClient, password: str = "OldPassword!123"):
+def login(client: TestClient, password: str = "OldPassword!123", account: str = "2026000001"):
     captcha_id, captcha_code = captcha_value(client)
     return client.post(
         "/api/v1/auth/login",
         json={
-            "account": "2026000001",
+            "account": account,
             "password": password,
             "captchaId": captcha_id,
             "captchaCode": captcha_code,

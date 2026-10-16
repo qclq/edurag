@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { ArrowRight, Collection, EditPen, WarnTriangleFilled } from '@element-plus/icons-vue'
+import QuickKnowledgeBaseDialog from '../components/QuickKnowledgeBaseDialog.vue'
 import { authenticatedRequest, useAuth } from '../stores/auth'
 
 const { state } = useAuth()
@@ -17,7 +18,10 @@ const quickDocuments = ref([])
 const serviceStatus = ref(null)
 const loading = ref(false)
 const submitting = ref(false)
+const createKbOpen = ref(false)
 const questionMaxLength = computed(() => state.bootstrap?.questionLimits?.maxLength || 500)
+const readyDocumentCount = computed(() => knowledgeBases.value.reduce((sum, item) => sum + (item.readyDocumentCount || 0), 0))
+const primaryLabel = computed(() => knowledgeBases.value.length ? '开始检索' : state.user?.canAccessAdmin ? '创建首个知识库' : '暂无可检索知识库')
 
 const loadHome = async () => {
   loading.value = true
@@ -42,6 +46,11 @@ const loadHome = async () => {
 }
 
 const submit = async () => {
+  if (!knowledgeBases.value.length) {
+    if (state.user?.canAccessAdmin) createKbOpen.value = true
+    else ElMessage.warning('当前账号没有可检索的知识库，请联系管理员授权')
+    return
+  }
   const content = question.value.trim()
   if (!content) {
     ElMessage.warning('请输入要咨询的问题')
@@ -52,17 +61,36 @@ const submit = async () => {
     return
   }
   submitting.value = true
+  let conversation = null
   try {
-    const conversation = await authenticatedRequest('/conversations', {
+    conversation = await authenticatedRequest('/conversations', {
       method: 'POST',
       body: { knowledgeBaseIds: [kb.value], title: content.slice(0, 30) },
     })
-    await router.push({ path: '/chat', query: { conversationId: conversation.id, question: content } })
+    await authenticatedRequest(`/conversations/${conversation.id}/messages`, {
+      method: 'POST',
+      body: {
+        content,
+        knowledgeBaseIds: [kb.value],
+        clientRequestId: crypto.randomUUID?.() || `home-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      },
+    })
+    question.value = ''
+    await router.push({ path: '/chat', query: { conversationId: conversation.id } })
   } catch (error) {
-    ElMessage.error(error.message || '创建会话失败')
+    if (conversation?.id) {
+      try { await authenticatedRequest(`/conversations/${conversation.id}`, { method: 'DELETE' }) } catch { /* Best-effort cleanup for an empty conversation. */ }
+    }
+    ElMessage.error(error.message || '检索请求提交失败')
   } finally {
     submitting.value = false
   }
+}
+
+const handleKnowledgeBaseCreated = async (created) => {
+  await loadHome()
+  kb.value = created.id
+  ElMessage.success('知识库已创建，请先上传资料；也可以继续测试问答流程')
 }
 
 const chooseHotQuestion = (item) => {
@@ -125,14 +153,21 @@ onMounted(loadHome)
       <el-select ref="kbSelect" v-model="kb" style="width:100%" placeholder="暂无可用知识库" :disabled="!knowledgeBases.length">
         <el-option v-for="item in knowledgeBases" :key="item.id" :label="item.name" :value="item.id" />
       </el-select>
+      <el-alert v-if="!knowledgeBases.length" class="setup-alert" title="尚未创建知识库，检索和文档入库暂不可用。" type="warning" show-icon :closable="false">
+        <template #default><el-button v-if="state.user?.canAccessAdmin" link type="primary" @click="createKbOpen = true">立即创建首个知识库</el-button><span v-else>请联系管理员创建并授权知识库。</span></template>
+      </el-alert>
+      <el-alert v-else-if="readyDocumentCount === 0" class="setup-alert" title="当前知识库还没有已入库文档，回答将没有可引用资料。" type="info" show-icon :closable="false">
+        <template #default><el-button v-if="state.user?.canAccessAdmin" link type="primary" @click="router.push('/admin/upload')">前往上传文档</el-button></template>
+      </el-alert>
       <label>详细问题描述 <small>{{ question.length }}/{{questionMaxLength}}</small></label>
       <el-input v-model="question" type="textarea" :rows="7" :maxlength="questionMaxLength" placeholder="请描述你想了解的制度、条件或办理事项，包含年份与身份信息会更准确..." @keydown.enter.exact.prevent="submit" />
       <div class="ask-tools"><span>Enter 发送，Shift + Enter 换行</span></div>
-      <el-button class="primary-btn ask-submit" :loading="submitting" :disabled="!knowledgeBases.length || !question.trim()" @click="submit">开始检索 <el-icon><ArrowRight /></el-icon></el-button>
+      <el-button class="primary-btn ask-submit" :loading="submitting" :disabled="knowledgeBases.length ? !question.trim() : !state.user?.canAccessAdmin" @click="submit">{{ primaryLabel }} <el-icon><ArrowRight /></el-icon></el-button>
       <p class="disclaimer"><el-icon><WarnTriangleFilled /></el-icon>免责声明：AI 生成内容均基于校方上传文档，重要学籍与财务决策请以校内最新正式红头文件及主管办公室通知为准。</p>
       <div class="quality-grid"><div><small>向量检索</small><strong>{{ serviceStatus?.embedding?.configured ? '可用' : '待配置' }}</strong><span>{{ serviceStatus?.embedding?.model || '—' }}</span></div><div><small>回答模型</small><strong>{{ serviceStatus?.answering?.configured ? '可用' : '待配置' }}</strong><span>{{ serviceStatus?.answering?.model || '—' }}</span></div></div>
       <div class="quick-docs"><b>常用规章速查单</b><p v-if="!quickDocuments.length">暂无常用文档数据</p><p v-for="doc in quickDocuments" :key="doc.id" role="button" tabindex="0" @click="router.push({path:'/source',query:{documentId:doc.id}})" @keydown.enter="router.push({path:'/source',query:{documentId:doc.id}})">{{ doc.displayName }} <i>{{ doc.category || '文档' }}</i></p></div>
     </aside>
+    <QuickKnowledgeBaseDialog v-model="createKbOpen" @created="handleKnowledgeBaseCreated" />
   </div>
 </template>
 
@@ -177,6 +212,7 @@ onMounted(loadHome)
 .ask-panel > label { display:flex; justify-content:space-between; margin:14px 0 7px; color:#334155; font-size:11px; font-weight:700; }.ask-panel>label small{color:#94a3b8;font-weight:500}
 .ask-tools { display:flex; align-items:center; margin-top:6px; }.ask-tools span{margin-left:auto;color:#64748b;font-size:10px}
 .ask-submit { width:100%; height:42px; margin-top:7px; }
+.setup-alert { margin-top:10px; }
 .disclaimer { display:flex; gap:7px; margin:14px 0; padding:10px; border-radius:9px; background:#eff4ff; color:#64748b; font-size:9px; line-height:1.5; }.disclaimer .el-icon{flex:none;color:#0051d5;margin-top:2px}
 .quality-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }.quality-grid>div{padding:11px;border-radius:9px;background:#f8fafc}.quality-grid small,.quality-grid span{display:block;color:#64748b;font-size:9px}.quality-grid strong{display:block;margin:4px 0;color:#059669;font-size:18px}.quality-grid em{font-size:9px;font-style:normal}
 .quick-docs { padding-top:15px; margin-top:15px; border-top:1px solid #eff4ff; }.quick-docs>b{display:flex;justify-content:space-between;font-size:11px}.quick-docs a{color:#0051d5;font-size:9px}.quick-docs p{display:flex;align-items:center;justify-content:space-between;gap:7px;margin:10px 0 0;color:#64748b;font-size:9px}.quick-docs i{font-style:normal;color:#94a3b8;font-size:8px}

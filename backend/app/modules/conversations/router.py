@@ -45,6 +45,11 @@ from app.workers.answer_generation import dispatch_answer_generation
 router = APIRouter()
 
 
+def _ensure_personal_history_allowed(user: User) -> None:
+    if user.user_type == "external":
+        raise AppError(403, "EXTERNAL_HISTORY_FORBIDDEN", "外部人员账号不提供个人历史会话功能")
+
+
 @router.post("/conversations", status_code=201, summary="创建会话")
 def post_conversation(
     payload: ConversationCreate,
@@ -70,6 +75,7 @@ def list_conversations(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    _ensure_personal_history_allowed(user)
     statement = (
         select(Conversation)
         .options(selectinload(Conversation.knowledge_bases))
@@ -110,6 +116,7 @@ def patch_conversation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    _ensure_personal_history_allowed(user)
     conversation = get_conversation_or_404(db, conversation_id, user)
     if payload.title is not None:
         conversation.title = payload.title
@@ -125,6 +132,7 @@ def delete_conversation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    _ensure_personal_history_allowed(user)
     conversation = get_conversation_or_404(db, conversation_id, user)
     conversation.deleted_at = utcnow()
     conversation.status = "deleted"
@@ -140,6 +148,7 @@ def clear_messages(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    _ensure_personal_history_allowed(user)
     conversation = get_conversation_or_404(db, conversation_id, user)
     if not confirm:
         raise AppError(400, "CONFIRMATION_REQUIRED", "请确认清空记录")

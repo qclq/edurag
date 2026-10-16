@@ -19,9 +19,9 @@ class SettingsUpdate(ApiModel):
 
 class UserCreate(ApiModel):
     name: str = Field(min_length=1, max_length=100)
-    account: str = Field(min_length=2, max_length=100)
+    account: str | None = Field(default=None, min_length=2, max_length=100)
     student_or_staff_no: str | None = Field(default=None, max_length=50)
-    user_type: Literal["student", "staff", "external"] = "staff"
+    user_type: Literal["student", "staff", "external"] = "student"
     department_id: uuid.UUID | None = None
     email: str | None = Field(default=None, max_length=320)
     phone: str | None = Field(default=None, max_length=30)

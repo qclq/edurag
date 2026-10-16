@@ -15,7 +15,9 @@ class LoginRequest(ApiModel):
     password: str = Field(min_length=PASSWORD_MIN_LENGTH, max_length=PASSWORD_MAX_LENGTH)
     captcha_id: str | None = None
     captcha_code: str | None = Field(default=None, min_length=1, max_length=10)
-    remember: bool = False
+    # Kept for backwards compatibility with older clients. All successful
+    # logins now use the configured monthly persistent-session policy.
+    remember: bool = True
 
 
 class SsoCallbackQuery(ApiModel):

@@ -27,6 +27,11 @@ from app.modules.users.models import Role, User
 
 
 CAPTCHA_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+CAPTCHA_WIDTH = 120
+CAPTCHA_HEIGHT = 40
+CAPTCHA_HORIZONTAL_PADDING = 8
+EXTERNAL_GUEST_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+EXTERNAL_GUEST_ACCOUNT = "external-guest"
 
 
 def client_context(request: Request) -> tuple[str | None, str | None]:
@@ -47,24 +52,31 @@ def create_captcha(db: Session, settings: Settings) -> dict[str, object]:
     db.refresh(challenge)
     rng = random.SystemRandom()
     glyphs = []
+    glyph_slot_width = (CAPTCHA_WIDTH - 2 * CAPTCHA_HORIZONTAL_PADDING) / len(code)
     for index, character in enumerate(code):
-        x = 18 + index * 25
-        y = rng.randint(31, 42)
-        angle = rng.randint(-18, 18)
+        # Keep every rotated glyph inside a generous safe area.  The old
+        # baseline could be as low as 42 on a 48px canvas, so rotated letters
+        # were frequently clipped along the bottom edge.
+        x = CAPTCHA_HORIZONTAL_PADDING + glyph_slot_width * (index + 0.5)
+        y = rng.randint(27, 31)
+        angle = rng.randint(-12, 12)
         glyphs.append(
-            f'<text x="{x}" y="{y}" transform="rotate({angle} {x} {y})">{html.escape(character)}</text>'
+            f'<text x="{x:.1f}" y="{y}" transform="rotate({angle} {x:.1f} {y})">'
+            f"{html.escape(character)}</text>"
         )
     lines = "".join(
-        f'<line x1="{rng.randint(0, 120)}" y1="{rng.randint(0, 48)}" '
-        f'x2="{rng.randint(0, 120)}" y2="{rng.randint(0, 48)}" />'
+        f'<line x1="{rng.randint(0, CAPTCHA_WIDTH)}" y1="{rng.randint(0, CAPTCHA_HEIGHT)}" '
+        f'x2="{rng.randint(0, CAPTCHA_WIDTH)}" y2="{rng.randint(0, CAPTCHA_HEIGHT)}" />'
         for _ in range(5)
     )
     svg = (
-        '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="48" viewBox="0 0 120 48">'
-        '<rect width="120" height="48" rx="8" fill="#eff4ff"/>'
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{CAPTCHA_WIDTH}" height="{CAPTCHA_HEIGHT}" '
+        f'viewBox="0 0 {CAPTCHA_WIDTH} {CAPTCHA_HEIGHT}">'
+        f'<rect width="{CAPTCHA_WIDTH}" height="{CAPTCHA_HEIGHT}" rx="8" fill="#eff4ff"/>'
         '<g stroke="#93b4e8" stroke-width="1" opacity=".65">'
         f"{lines}</g>"
-        '<g fill="#174a93" font-family="monospace" font-size="24" font-weight="700">'
+        '<g fill="#174a93" font-family="monospace" font-size="22" font-weight="700" '
+        'text-anchor="middle">'
         f'{"".join(glyphs)}</g></svg>'
     )
     encoded = base64.b64encode(svg.encode()).decode()
@@ -141,11 +153,11 @@ def create_session(
     raw_refresh = new_refresh_token()
     now = utcnow()
     if expires_at is None:
-        expires_at = now + (
-            timedelta(days=settings.remember_session_days)
-            if remember
-            else timedelta(hours=settings.refresh_session_hours)
-        )
+        # Browser restarts must not sign the user out, while the absolute
+        # expiry still forces a fresh password/SSO login once every month.
+        # Refresh-token rotation deliberately passes the original expires_at,
+        # so activity never turns this into an indefinitely rolling session.
+        expires_at = now + timedelta(days=settings.remember_session_days)
     auth_session = AuthSession(
         user_id=user.id,
         refresh_token_hash=token_digest(raw_refresh, settings),
@@ -177,7 +189,7 @@ def authenticate_local(
     user = db.scalar(
         select(User)
         .options(selectinload(User.roles).selectinload(Role.permissions))
-        .where(func.lower(User.account) == account)
+        .where(func.lower(User.account) == account, User.status != "deleted")
     )
     password_hash = user.password_hash if user and user.password_hash else DUMMY_PASSWORD_HASH
     valid_password = verify_password(payload.password, password_hash)
@@ -254,6 +266,57 @@ def authenticate_local(
         remember=payload.remember,
         ip=ip,
         user_agent=user_agent,
+    )
+    db.commit()
+    return user, auth_session, raw_refresh, access_token, expires_in
+
+
+def authenticate_external_guest(
+    db: Session, request: Request, settings: Settings
+) -> tuple[User, AuthSession, str, str, int]:
+    normal_role = db.scalar(select(Role).where(Role.code == "normal_user"))
+    if normal_role is None:
+        raise AppError(503, "AUTH_EXTERNAL_ACCESS_UNAVAILABLE", "外部人员访问暂不可用")
+    user = db.scalar(
+        select(User)
+        .options(selectinload(User.roles).selectinload(Role.permissions))
+        .where(User.id == EXTERNAL_GUEST_ID)
+    )
+    if user is None:
+        user = User(
+            id=EXTERNAL_GUEST_ID,
+            account=EXTERNAL_GUEST_ACCOUNT,
+            name="外部访客",
+            user_type="external",
+            status="active",
+            auth_source="guest",
+            external_subject="public-external-access",
+            roles=[normal_role],
+        )
+        db.add(user)
+        db.flush()
+    elif user.status != "active":
+        raise AppError(503, "AUTH_EXTERNAL_ACCESS_UNAVAILABLE", "外部人员访问暂不可用")
+    now = utcnow()
+    ip, user_agent = client_context(request)
+    user.last_login_at = now
+    record_login(
+        db,
+        account=EXTERNAL_GUEST_ACCOUNT,
+        user=user,
+        result="success",
+        error_code=None,
+        ip=ip,
+        user_agent=user_agent,
+    )
+    auth_session, raw_refresh, access_token, expires_in = create_session(
+        db,
+        user,
+        settings,
+        remember=False,
+        ip=ip,
+        user_agent=user_agent,
+        expires_at=now + timedelta(hours=settings.refresh_session_hours),
     )
     db.commit()
     return user, auth_session, raw_refresh, access_token, expires_in

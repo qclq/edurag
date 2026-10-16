@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
-from app.api.deps import CurrentAuth, get_current_auth, get_current_user
+from app.api.deps import CurrentAuth, get_current_auth
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError, success
 from app.core.security import as_utc, utcnow
@@ -17,6 +17,7 @@ from app.integrations.sso.provider import (
 )
 from app.modules.auth.schemas import LoginRequest, SsoChannel
 from app.modules.auth.service import (
+    authenticate_external_guest,
     authenticate_local,
     client_context,
     create_captcha,
@@ -25,7 +26,6 @@ from app.modules.auth.service import (
     revoke_session,
     rotate_refresh_token,
 )
-from app.modules.users.models import User
 from app.modules.users.service import user_payload
 
 
@@ -91,6 +91,29 @@ def login(
     return response
 
 
+@router.post("/external-access", summary="外部人员访客访问")
+def external_access(
+    request: Request,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+):
+    user, auth_session, refresh_token, access_token, expires_in = authenticate_external_guest(
+        db, request, settings
+    )
+    response = success(
+        request,
+        {
+            "accessToken": access_token,
+            "tokenType": "Bearer",
+            "expiresIn": expires_in,
+            "user": user_payload(user, db),
+        },
+    )
+    set_refresh_cookie(response, refresh_token, auth_session.expires_at, settings)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @router.post("/refresh", summary="轮换刷新会话")
 def refresh(
     request: Request,
@@ -128,8 +151,8 @@ def logout(
 
 
 @router.get("/me", summary="获取当前用户和权限")
-def me(request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    response = success(request, user_payload(user, db))
+def me(request: Request, auth: CurrentAuth = Depends(get_current_auth), db: Session = Depends(get_db)):
+    response = success(request, user_payload(auth.user, db))
     response.headers["Cache-Control"] = "no-store"
     return response
 

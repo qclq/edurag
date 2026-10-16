@@ -28,7 +28,7 @@ docker run --rm -p 8080:80 edurag-frontend
 
 | 原型编号 | 页面 | 路由 |
 | --- | --- | --- |
-| P01 | 登录与统一身份认证 | `/login` |
+| P01 | 学工号密码登录 | `/login` |
 | U01 | 问答首页 | `/home` |
 | U02 | 对话详情 | `/chat` |
 | U03 | 历史会话 | `/history` |

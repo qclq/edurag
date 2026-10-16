@@ -86,6 +86,7 @@ class User(Base, TimestampMixin):
     last_active_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     failed_login_count: Mapped[int] = mapped_column(default=0, nullable=False)
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     row_version: Mapped[int] = mapped_column(default=1, nullable=False)
 
     department: Mapped[Department | None] = relationship(lazy="joined")

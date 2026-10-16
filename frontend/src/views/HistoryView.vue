@@ -20,7 +20,7 @@ const page = ref(1)
 const total = ref(0)
 const pageSize = 20
 let searchTimer = null
-const filtered = computed(() => sessions.filter(s => !query.value || `${s.title}${s.text}`.includes(query.value)))
+const filtered = computed(() => sessions.value.filter(s => !query.value || `${s.title}${s.text}`.includes(query.value)))
 const groups = computed(() => [...new Set(filtered.value.map(s => s.group))])
 
 const rangeValues = { 全部: '', 今天: 'today', 最近7天: '7d', 本月: '30d' }
@@ -136,7 +136,7 @@ onBeforeUnmount(() => window.clearTimeout(searchTimer))
     </PageHeader>
 
     <div class="history-grid">
-      <section>
+      <section class="history-main">
         <div class="history-filter panel">
           <el-input v-model="query" :prefix-icon="Search" clearable placeholder="搜索会话标题、问答内容或引用规范..." />
           <el-select v-model="kbId" placeholder="全部知识库" clearable style="width:180px"><template #prefix><el-icon><FolderOpened /></el-icon></template><el-option v-for="item in knowledgeBases" :key="item.id" :label="item.name" :value="item.id" /></el-select>
@@ -171,13 +171,16 @@ onBeforeUnmount(() => window.clearTimeout(searchTimer))
 </template>
 
 <style scoped>
-.history-grid { display:grid; grid-template-columns:minmax(0,1fr) 330px; gap:19px; align-items:start; }
-.history-filter { display:grid; grid-template-columns:minmax(240px,1fr) 180px auto; gap:10px; padding:13px; margin-bottom:22px; }
+.history-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(280px,330px); gap:19px; align-items:start; }
+.history-main { min-width:0; }
+.history-filter { min-width:0; display:grid; grid-template-columns:minmax(0,1fr) minmax(150px,180px) auto; gap:10px; padding:13px; margin-bottom:22px; }
+.history-filter .el-segmented { min-width:0; }
 .session-group { margin-bottom:23px; }.session-group>header{display:flex;align-items:center;gap:9px;margin:0 4px 10px}.session-group>header>span{width:7px;height:7px;border-radius:50%;background:#0051d5}.session-group>header b{font-size:12px}.session-group>header small{color:#94a3b8;margin-left:4px}
 .session-card { padding:18px 19px; margin-top:10px; border-radius:16px; background:#fff; box-shadow:var(--shadow); cursor:pointer; transition:.18s; }.session-card:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(15,23,42,.08)}.session-card.active{box-shadow:0 6px 24px rgba(0,81,213,.12);outline:2px solid rgba(0,81,213,.16)}
 .session-top { display:flex; align-items:center; gap:9px; }.session-top h3{flex:1;min-width:0;margin:0;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.session-actions{display:flex;flex:none}.session-card>p{margin:12px 0;color:#64748b;font-size:11px;line-height:1.65;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.session-card footer{display:flex;gap:22px;padding-top:11px;border-top:1px solid #eff4ff;color:#64748b;font-size:10px}.session-card footer time{margin-left:auto}
 .history-pager { display:flex; align-items:center; justify-content:space-between; padding:15px 3px; color:#64748b; font-size:10px; }
 .history-insight { position:sticky; top:88px; padding:20px; }.insight-head{display:flex;justify-content:space-between;align-items:center;padding-bottom:14px;border-bottom:1px solid #eff4ff}.insight-head>div{display:flex;flex-direction:column;gap:3px}.insight-head b{font-size:14px}.insight-head span{color:#94a3b8;font-size:9px}.history-insight dl{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:14px 0}.history-insight dl>div{padding:10px;border-radius:9px;background:#f8fafc}.history-insight dt{color:#94a3b8;font-size:9px}.history-insight dd{margin:5px 0 0;font-size:11px;font-weight:700}.history-insight dd small{font-size:8px;color:#94a3b8}.green{color:#059669}.history-insight h4{margin:18px 0 10px;font-size:11px}.evidence{display:flex;gap:9px;padding:10px;margin-top:8px;border-radius:9px;background:#f8fafc}.evidence>span{height:max-content;padding:3px 5px;border-radius:4px;color:#dc2626;background:#fef2f2;font-size:8px;font-weight:800}.evidence p{margin:0;min-width:0}.evidence b,.evidence small{display:block}.evidence b{font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.evidence small{margin-top:4px;color:#64748b;font-size:9px}.full-btn{width:100%;margin-top:14px}.distribution p{display:flex;justify-content:space-between;margin:8px 0 5px;color:#64748b;font-size:10px}.distribution div{height:5px;border-radius:99px;background:#eff4ff;overflow:hidden}.distribution i{display:block;height:100%;border-radius:99px;background:#0051d5}.delete-title{display:flex;align-items:center;gap:11px}.delete-title>span{width:36px;height:36px;display:grid;place-items:center;border-radius:10px;background:#fef2f2;color:#dc2626}.delete-title>div{display:flex;flex-direction:column}.delete-title small{color:#94a3b8;font-size:10px}.delete-copy{color:#475569;font-size:12px}.delete-warning{padding:12px;border-radius:9px;background:#fef2f2;color:#dc2626;font-size:11px}.delete-warning p{margin:5px 0 0;color:#7f1d1d;line-height:1.6}
-@media(max-width:1180px){.history-grid{grid-template-columns:1fr}.history-insight{position:static}.history-filter{grid-template-columns:1fr 180px}.history-filter .el-segmented{grid-column:1/-1}}
+@media(max-width:1400px){.history-filter{grid-template-columns:minmax(0,1fr) minmax(150px,180px)}.history-filter .el-segmented{grid-column:1/-1}}
+@media(max-width:1180px){.history-grid{grid-template-columns:1fr}.history-insight{position:static}}
 @media(max-width:640px){.history-filter{grid-template-columns:1fr}.history-filter .el-select{width:100%!important}.session-top{align-items:flex-start;flex-wrap:wrap}.session-top h3{order:2;flex-basis:80%}.session-actions{margin-left:auto}.session-card footer{flex-wrap:wrap}.session-card footer time{margin-left:0}.history-pager{align-items:flex-start;gap:10px;flex-direction:column}}
 </style>

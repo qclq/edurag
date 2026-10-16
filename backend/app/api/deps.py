@@ -69,6 +69,8 @@ def get_current_auth(
 
 
 def get_current_user(auth: CurrentAuth = Depends(get_current_auth)) -> User:
+    if auth.user.must_change_password:
+        raise AppError(403, "AUTH_PASSWORD_CHANGE_REQUIRED", "首次登录必须先修改初始密码")
     return auth.user
 
 
@@ -78,6 +80,12 @@ def permission_codes(user: User) -> set[str]:
 
 def is_super_admin(user: User) -> bool:
     return any(role.code == "super_admin" for role in user.roles)
+
+
+def require_super_admin(user: User = Depends(get_current_user)) -> User:
+    if not is_super_admin(user):
+        raise AppError(403, "SUPER_ADMIN_REQUIRED", "只有超级管理员可以管理用户账户")
+    return user
 
 
 def require_permissions(*required: str, any_of: bool = False):

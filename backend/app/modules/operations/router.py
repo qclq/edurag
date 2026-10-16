@@ -29,10 +29,15 @@ from app.modules.users.models import User
 
 admin_router = APIRouter()
 notification_router = APIRouter()
+ADMIN_ROLE_CODES = {"knowledge_admin", "user_admin", "super_admin"}
 
 
 def _range_start(value: str):
     return utcnow() - timedelta(days={"today": 1, "7d": 7, "30d": 30}.get(value, 7))
+
+
+def _is_admin_account(user: User) -> bool:
+    return any(role.code in ADMIN_ROLE_CODES for role in user.roles)
 
 
 def feedback_payload(item: Feedback, *, detailed: bool = False) -> dict:
@@ -157,7 +162,8 @@ def knowledge_gaps(
     if not is_super_admin(user):
         messages = [
             item for item in messages
-            if any(can_access(kb, user, "manage") for kb in item.conversation.knowledge_bases)
+            if db.scalar(select(User.user_type).where(User.id == item.conversation.user_id)) != "external"
+            and any(can_access(kb, user, "manage") for kb in item.conversation.knowledge_bases)
         ]
     groups = {}
     for message in messages:
@@ -230,11 +236,21 @@ def qa_records(
         statement = statement.where(Message.status == status)
     if q:
         statement = statement.where(Message.content.ilike(f"%{q}%"))
+    super_admin = is_super_admin(user)
+    external_user_ids = set(db.scalars(select(User.id).where(User.user_type == "external")).all())
     visible = [
         item
         for item in db.scalars(statement).unique().all()
-        if is_super_admin(user)
-        or any(can_access(kb, user, "manage") for kb in item.conversation.knowledge_bases)
+        if (
+            super_admin
+            or (
+                item.conversation.user_id not in external_user_ids
+                and (
+                    _is_admin_account(user)
+                    or any(can_access(kb, user, "manage") for kb in item.conversation.knowledge_bases)
+                )
+            )
+        )
     ]
     total = len(visible)
     items = visible[page.offset : page.offset + page.page_size]
@@ -261,8 +277,16 @@ def qa_record_detail(
         )
         .where(Message.id == message_id, Message.role == "assistant")
     )
+    external_owner = bool(
+        message
+        and db.scalar(select(User.user_type).where(User.id == message.conversation.user_id)) == "external"
+    )
     if not message or (
-        not is_super_admin(user)
+        external_owner
+        and not is_super_admin(user)
+    ) or (
+        not external_owner
+        and not _is_admin_account(user)
         and not any(can_access(kb, user, "manage") for kb in message.conversation.knowledge_bases)
     ):
         raise AppError(404, "QA_RECORD_NOT_FOUND", "问答记录不存在")
@@ -299,7 +323,10 @@ def list_feedbacks(
 
 
 def _feedback_visible(db: Session, item: Feedback, user: User) -> bool:
-    if is_super_admin(user):
+    creator_type = db.scalar(select(User.user_type).where(User.id == item.created_by))
+    if creator_type == "external":
+        return is_super_admin(user)
+    if _is_admin_account(user):
         return True
     if item.knowledge_base_id:
         try:

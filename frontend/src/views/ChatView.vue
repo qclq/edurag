@@ -13,8 +13,6 @@ const input = ref('')
 const messages = ref([])
 const generating = ref(false)
 const conversation = ref(null)
-const knowledgeBases = ref([])
-const selectedKnowledgeBases = ref([])
 const loading = ref(false)
 let pollTimer = null
 let disposed = false
@@ -23,6 +21,7 @@ const terminalStatuses = new Set(['completed', 'no_answer', 'stopped', 'failed']
 const assistantMessages = computed(() => messages.value.filter(message => message.role === 'assistant'))
 const latestAssistant = computed(() => assistantMessages.value.at(-1) || null)
 const latestCitations = computed(() => latestAssistant.value?.citations || [])
+const isExternalUser = computed(() => state.user?.userType === 'external')
 
 const formatTime = (value) => value
   ? new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(value))
@@ -34,7 +33,6 @@ const loadConversation = async (id, { silent = false } = {}) => {
     const data = await authenticatedRequest(`/conversations/${id}`)
     conversation.value = data
     messages.value = data.messages || []
-    selectedKnowledgeBases.value = (data.knowledgeBases || []).map(item => item.id)
     generating.value = messages.value.some(message => message.role === 'assistant' && !terminalStatuses.has(message.status))
     return data
   } finally {
@@ -57,10 +55,9 @@ const schedulePoll = () => {
 
 const ensureConversation = async (content) => {
   if (conversation.value) return conversation.value
-  if (!selectedKnowledgeBases.value.length) throw new Error('请至少选择一个知识库')
   const created = await authenticatedRequest('/conversations', {
     method: 'POST',
-    body: { knowledgeBaseIds: selectedKnowledgeBases.value, title: content.slice(0, 30) },
+    body: { title: content.slice(0, 30) },
   })
   conversation.value = { ...created, messages: [] }
   window.history.replaceState({}, '', router.resolve({ path: '/chat', query: { conversationId: created.id } }).href)
@@ -77,7 +74,6 @@ const send = async (preset) => {
       method: 'POST',
       body: {
         content,
-        knowledgeBaseIds: selectedKnowledgeBases.value,
         clientRequestId: crypto.randomUUID?.() || `web-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       },
     })
@@ -174,10 +170,8 @@ const rate = async (message, value) => {
 
 onMounted(async () => {
   try {
-    knowledgeBases.value = await authenticatedRequest('/knowledge-bases/options?selectable=true')
     const id = typeof route.query.conversationId === 'string' ? route.query.conversationId : null
     if (id) await loadConversation(id)
-    else if (knowledgeBases.value.length) selectedKnowledgeBases.value = [knowledgeBases.value[0].id]
     const initialQuestion = typeof route.query.question === 'string' ? route.query.question : ''
     if (initialQuestion) await send(initialQuestion)
     else if (generating.value) schedulePoll()
@@ -195,8 +189,8 @@ onBeforeUnmount(() => {
 <template>
   <div class="page-content chat-page">
     <header class="chat-header panel">
-      <div><div class="chat-title-row"><h1>{{ conversation?.title || '新对话' }}</h1><el-button v-if="conversation" text circle :icon="Edit" aria-label="重命名" @click="renameConversation" /></div><p>已绑定索引库：<span v-for="item in conversation?.knowledgeBases || []" :key="item.id">{{ item.name }}</span><span v-if="!conversation">发送首条问题时创建会话</span></p></div>
-      <div><el-button :icon="Star" :disabled="!conversation" @click="toggleFavorite">{{ conversation?.favorite ? '取消收藏' : '收藏会话' }}</el-button><el-button :icon="Delete" :disabled="!messages.length" @click="clearMessages">清空记录</el-button><el-button class="primary-btn" :icon="Top" @click="router.push('/home')">返回问答首页</el-button></div>
+      <div><div class="chat-title-row"><h1>{{ conversation?.title || '新对话' }}</h1><el-button v-if="conversation && !isExternalUser" text circle :icon="Edit" aria-label="重命名" @click="renameConversation" /></div><p>自动检索范围：<span v-for="item in conversation?.knowledgeBases || []" :key="item.id">{{ item.name }}</span><span v-if="!conversation">发送后自动检索全部授权知识库</span></p></div>
+      <div><el-button v-if="!isExternalUser" :icon="Star" :disabled="!conversation" @click="toggleFavorite">{{ conversation?.favorite ? '取消收藏' : '收藏会话' }}</el-button><el-button v-if="!isExternalUser" :icon="Delete" :disabled="!messages.length" @click="clearMessages">清空记录</el-button><el-button class="primary-btn" :icon="Top" @click="router.push('/home')">返回问答首页</el-button></div>
     </header>
 
     <div class="chat-layout">
@@ -210,7 +204,7 @@ onBeforeUnmount(() => {
             <header><span class="ai-avatar">AI</span><div><b>校园智库助手</b><small>{{ message.modelName || message.statusLabel }} · {{ formatTime(message.createdAt) }}</small></div><StatusPill :tone="message.status === 'failed' ? 'danger' : message.status === 'completed' ? 'success' : 'info'" :text="message.statusLabel" /></header>
             <p v-if="message.content" class="answer-intro">{{ message.content }}</p>
             <p v-else-if="message.error" class="answer-intro">{{ message.error.message }}</p>
-            <div v-else class="retrieval-card"><div><span class="rag-icon"><el-icon><ZoomIn /></el-icon></span><p><b>正在检索并生成回答</b><small>页面会自动更新，无需手动刷新</small></p></div></div>
+            <div v-else class="retrieval-card"><div><span class="rag-icon"><el-icon><ZoomIn /></el-icon></span><p><b>正在拆解问题、检索资料并生成回答</b><small>页面会自动更新，无需手动刷新</small></p></div></div>
             <template v-if="message.citations?.length">
               <h3 class="sources-title">引用来源</h3>
               <div class="source-list"><button v-for="citation in message.citations" :key="citation.id" @click="router.push({path:'/source',query:{citationId:citation.id}})"><span>{{ citation.index }}</span><p><b>{{ citation.documentName || `引用 ${citation.index}` }}</b><small>{{ citation.section || '文档切片' }} · {{ citation.pageStart ? `第 ${citation.pageStart} 页` : '页码未标注' }}</small></p><el-icon><Top /></el-icon></button></div>
@@ -232,7 +226,7 @@ onBeforeUnmount(() => {
       </aside>
     </div>
 
-    <div class="composer panel"><div class="composer-status"><span><i />已登录：{{ state.user?.name }}</span><small>{{ generating ? '正在生成回答…' : 'Enter 发送，Shift + Enter 换行' }}</small></div><el-select v-if="!conversation" v-model="selectedKnowledgeBases" multiple collapse-tags placeholder="请选择知识库" style="width:100%;margin-top:8px"><el-option v-for="item in knowledgeBases" :key="item.id" :label="item.name" :value="item.id" /></el-select><div class="composer-row"><el-input v-model="input" type="textarea" :autosize="{minRows:1,maxRows:4}" :maxlength="state.bootstrap?.questionLimits?.maxLength || 500" placeholder="请输入问题" :disabled="generating" @keydown.enter.exact.prevent="send()" /><el-button v-if="generating" type="danger" plain circle aria-label="停止生成" @click="stopGeneration">■</el-button><el-button v-else class="primary-btn send-btn" circle :icon="Promotion" :disabled="!input.trim() || (!conversation && !selectedKnowledgeBases.length)" @click="send()" /></div><small class="composer-note">回答基于有权访问的校内资料生成，请通过引用来源核验重要信息。</small></div>
+    <div class="composer panel"><div class="composer-status"><span><i />自动检索全部授权资料</span><small>{{ generating ? '正在生成回答…' : 'Enter 发送，Shift + Enter 换行' }}</small></div><div class="composer-row"><el-input v-model="input" type="textarea" :autosize="{minRows:1,maxRows:4}" :maxlength="state.bootstrap?.questionLimits?.maxLength || 500" placeholder="请输入问题" :disabled="generating" @keydown.enter.exact.prevent="send()" /><el-button v-if="generating" type="danger" plain circle aria-label="停止生成" @click="stopGeneration">■</el-button><el-button v-else class="primary-btn send-btn" circle :icon="Promotion" :disabled="!input.trim()" @click="send()" /></div><small class="composer-note">回答模型会先拆解问题，再从你有权访问的全部资料中检索并整理答案。</small></div>
   </div>
 </template>
 
@@ -244,6 +238,6 @@ onBeforeUnmount(() => {
 .diagnostic{position:sticky;top:88px;padding:18px}.diagnostic-title{display:flex;align-items:center;gap:9px;padding-bottom:13px;border-bottom:1px solid #eff4ff}.diagnostic-title>span{width:32px;height:32px;display:grid;place-items:center;border-radius:9px;background:#eff4ff;color:#0051d5}.diagnostic-title>div{flex:1;display:flex;flex-direction:column}.diagnostic-title b{font-size:12px}.diagnostic-title small{color:#94a3b8;font-size:9px}.scores{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 0}.scores>div{padding:10px;border-radius:9px;background:#f8fafc}.scores>div:last-child{grid-column:1/-1}.scores small{display:block;color:#94a3b8;font-size:8px}.scores strong{display:block;margin-top:4px;color:#0051d5;font-size:18px}.scores em{color:#64748b;font-size:9px;font-style:normal;font-weight:500}.chunk{padding:12px;margin-top:9px;border:1px solid #eff4ff;border-radius:11px;cursor:pointer}.chunk.active{border-color:#bfdbfe;background:#f8fbff}.chunk header{display:flex;gap:8px}.chunk header>span{width:23px;height:23px;display:grid;place-items:center;border-radius:6px;background:#0051d5;color:#fff;font-size:8px}.chunk header div{display:flex;flex-direction:column}.chunk header b{font-size:9px}.chunk header small{color:#94a3b8;font-size:8px}.chunk>p{color:#64748b;font-size:9px;line-height:1.65}.chunk footer{display:flex;justify-content:space-between;color:#94a3b8;font-size:8px}.chunk a{color:#0051d5;cursor:pointer}.diagnostic h4{margin:16px 0 8px;font-size:10px}.strategy{display:flex;align-items:center;gap:7px;margin:8px 0;color:#475569;font-size:9px}.strategy .el-icon{color:#059669}
 .composer{position:fixed;z-index:30;right:32px;bottom:15px;left:288px;padding:12px 15px}.composer-status{display:flex;justify-content:space-between;color:#64748b;font-size:9px}.composer-status span{display:flex;align-items:center;gap:6px;color:#059669}.composer-status i{width:6px;height:6px;border-radius:50%;background:#10b981}.composer-row{display:flex;align-items:flex-end;gap:7px;margin-top:7px}.composer-row .el-textarea{flex:1}.send-btn{flex:none}.composer-note{display:block;margin-top:5px;color:#94a3b8;font-size:8px;text-align:center}
 @media(max-width:1180px){.chat-layout{grid-template-columns:1fr}.diagnostic{position:static}.composer{left:274px}.chat-header{align-items:flex-start;flex-direction:column}.chat-header>div:last-child{flex-wrap:wrap}}
-@media(max-width:960px){.composer{left:18px;right:18px}.source-list{grid-template-columns:1fr}}
+@media(max-width:1100px){.composer{left:18px;right:18px}.source-list{grid-template-columns:1fr}}
 @media(max-width:640px){.chat-page{padding-bottom:175px}.user-message{max-width:92%}.answer-card{padding:15px}.answer-actions{flex-wrap:wrap}.source-button{width:100%;margin-left:0}.composer{bottom:8px}.chat-header h1{font-size:16px}.chat-header>div:last-child .el-button:not(.primary-btn){display:none}}
 </style>
