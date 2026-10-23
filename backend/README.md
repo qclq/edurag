@@ -8,6 +8,7 @@
 - 本地认证、验证码、OIDC/CAS、refresh token 轮换、RBAC 和个人资料。
 - 知识库 CRUD、ACL、检索配置、检索测试和索引重建任务。
 - 安全暂存上传、文档/版本/切片、解析流水线、Qwen Embedding、Milvus outbox 与预览下载。
+- 支持 PDF、DOC/DOCX/DOCM/RTF、XLS/XLSX/XLSM/XLSB/CSV、PPT/PPTX/PPTM、ODT/ODS/ODP、Markdown 和 TXT；旧版与开放式 Office 文件先由 LibreOffice 无界面转换，Excel 按工作表与行区间预切分，PDF/演示文稿/Word 图片可先经 Qwen OCR 再切分向量化。
 - 会话、消息幂等、DeepSeek RAG、持久化 SSE、停止/重生成、引用和评价。
 - 任务中心、反馈处理、通知、首页/全局搜索、管理概览、问答审计、系统设置和审计日志。
 - 用户/角色/部门管理、CSV/XLSX 导入校验与导入、导出任务。
@@ -80,6 +81,8 @@ docker compose up -d --build
 QWEN_EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 QWEN_API_KEY=你的百炼密钥
 EMBEDDING_MODEL=text-embedding-v4
+QWEN_OCR_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+QWEN_OCR_MODEL=qwen-vl-ocr
 EMBEDDING_DIMENSION=1024
 
 DEEPSEEK_BASE_URL=https://api.deepseek.com

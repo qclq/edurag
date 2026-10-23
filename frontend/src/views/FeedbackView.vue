@@ -29,6 +29,12 @@ const archives = ref([])
 
 const statusTone = status => status === 'completed' || status === 'resolved' ? 'success' : status === 'failed' ? 'danger' : status === 'no_answer' || status === 'pending' ? 'warning' : 'info'
 const statusLabel = status => ({ completed:'回答完成', no_answer:'未检索到可靠依据', failed:'回答失败', stopped:'已停止', submitted:'已提交', retrieving:'检索中', generating:'生成中', pending:'待处理', processing:'处理中', resolved:'已解决' })[status] || status
+const feedbackTypeLabel = type => ({
+  unhelpful:'回答需改进',
+  user_suggestion:'功能建议', user_bug:'系统故障', user_content:'内容问题', user_other:'其他反馈',
+  conversation_answer_incorrect:'回答不正确', conversation_answer_incomplete:'回答不完整',
+  conversation_citation_issue:'引用问题', conversation_other:'对话其他问题',
+})[type] || type
 const resolutionOptions = [
   { label:'回答内容无误', value:'answer_correct' }, { label:'知识库缺少相关文档', value:'missing_document' },
   { label:'文档已过期', value:'document_outdated' }, { label:'文档内容冲突', value:'document_conflict' },
@@ -53,7 +59,7 @@ const loadData = async () => {
     authenticatedRequest('/admin/qa-summaries?pageSize=100', { includeEnvelope: true }),
   ])
   if (results[0].status === 'fulfilled') questions.value = (results[0].value.data || []).map(item => ({ ...item, user:item.userId, session:item.conversationId, kb:item.knowledgeBaseNames?.join('、') || '未关联知识库', state:statusLabel(item.status), tone:statusTone(item.status), refs:item.citationCount, time:new Date(item.createdAt).toLocaleString('zh-CN'), latency:item.totalMs != null ? `${item.totalMs}ms` : '—' }))
-  if (results[1].status === 'fulfilled') feedbacks.value = (results[1].value.data || []).map(item => ({ ...item, question:item.comment || `反馈 ${item.id.slice(0,8)}`, message:item.comment || '用户未补充说明', kb:item.knowledgeBaseId || '未关联知识库', state:statusLabel(item.status), tone:statusTone(item.status), owner:item.assigneeId ? '已领取' : '待领取', time:new Date(item.createdAt).toLocaleString('zh-CN'), updated:new Date(item.updatedAt).toLocaleString('zh-CN') }))
+  if (results[1].status === 'fulfilled') feedbacks.value = (results[1].value.data || []).map(item => ({ ...item, type:feedbackTypeLabel(item.type), question:item.comment || `反馈 ${item.id.slice(0,8)}`, message:item.comment || '用户未补充说明', kb:item.knowledgeBaseId || '未关联知识库', state:statusLabel(item.status), tone:statusTone(item.status), owner:item.assigneeId ? '已领取' : '待领取', time:new Date(item.createdAt).toLocaleString('zh-CN'), updated:new Date(item.updatedAt).toLocaleString('zh-CN') }))
   if (results[2].status === 'fulfilled') archives.value = results[2].value.data || []
   const failed = results.find(item => item.status === 'rejected')
   if (failed && !questions.value.length && !feedbacks.value.length && !archives.value.length) ElMessage.error(failed.reason?.message || '质量数据加载失败')

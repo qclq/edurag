@@ -26,7 +26,7 @@ class IngestionItem(ApiModel):
 
 
 class ProcessingConfig(ApiModel):
-    ocr_enabled: bool = False
+    ocr_enabled: bool = True
     chunk_size: int = Field(default=800, ge=100, le=4000)
     chunk_overlap: int = Field(default=100, ge=0, le=1000)
 

@@ -85,7 +85,7 @@ class DocumentVersion(Base):
     is_current: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     process_status: Mapped[str] = mapped_column(String(30), default="pending", nullable=False, index=True)
     process_stage: Mapped[str | None] = mapped_column(String(50))
-    ocr_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    ocr_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     chunk_size: Mapped[int] = mapped_column(Integer, default=800, nullable=False)
     chunk_overlap: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
     failure_code: Mapped[str | None] = mapped_column(String(100))

@@ -6,11 +6,13 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
+    "test": "node --test tests/*.test.mjs",
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",
     "element-plus": "^2.10.7",
+    "markdown-it": "^14.3.3",
     "vue": "^3.5.22",
     "vue-router": "^4.5.1"
   },

@@ -7,6 +7,8 @@ from app.core.config import Settings
 from app.core.security import hash_password, verify_password
 from app.integrations.embedding.provider import embed_texts
 from app.integrations.llm.provider import generate_answer, plan_retrieval_queries
+from app.integrations.storage import get_storage
+from app.modules.conversations.models import MessageRating
 from app.modules.documents.models import Document, DocumentChunk, DocumentVersion, StoredFile
 from app.modules.knowledge_bases.models import KnowledgeBase
 from app.modules.knowledge_bases.service import knowledge_base_code_from_name
@@ -174,10 +176,12 @@ def test_knowledge_base_and_draft_ingestion_flow(test_context):
 
 
 def test_conversation_message_rag_and_rating(test_context):
-    client, SessionMaker, _ = test_context
+    client, SessionMaker, settings = test_context
     headers = auth_headers(client)
     kb_data = create_kb(client, headers)
     kb_id = uuid.UUID(kb_data["id"])
+    original_file = "国家奖学金申请人须提交成绩单。".encode()
+    get_storage(settings).put("tests/rules.txt", original_file, "text/plain")
 
     with SessionMaker.begin() as db:
         user = db.scalar(select(User).where(User.account == "2026000001"))
@@ -185,7 +189,7 @@ def test_conversation_message_rag_and_rating(test_context):
             storage_key="tests/rules.txt",
             original_name="奖学金办法.txt",
             mime_type="text/plain",
-            size_bytes=20,
+            size_bytes=len(original_file),
             sha256="a" * 64,
             scan_status="clean",
             uploaded_by=user.id,
@@ -244,6 +248,20 @@ def test_conversation_message_rag_and_rating(test_context):
     assistant = answer.json()["data"]["assistantMessage"]
     assert assistant["status"] == "completed"
     assert assistant["citations"][0]["pageStart"] == 3
+    assert assistant["citations"][0]["documentName"] == "奖学金管理办法"
+    assert assistant["citations"][0]["downloadUrl"] == f"/api/v1/citations/{assistant['citations'][0]['id']}/download"
+    assert assistant["downloadableDocuments"] == [
+        {
+            "documentId": str(document.id),
+            "documentName": "奖学金管理办法",
+            "fileName": "奖学金办法.txt",
+            "downloadUrl": f"/api/v1/citations/{assistant['citations'][0]['id']}/download",
+        }
+    ]
+    downloaded = client.get(assistant["downloadableDocuments"][0]["downloadUrl"], headers=headers)
+    assert downloaded.status_code == 200, downloaded.text
+    assert downloaded.content == original_file
+    assert "attachment" in downloaded.headers["content-disposition"]
 
     rating = client.put(
         f"/api/v1/messages/{assistant['id']}/rating",
@@ -252,6 +270,27 @@ def test_conversation_message_rag_and_rating(test_context):
     )
     assert rating.status_code == 200
     assert rating.json()["data"]["feedbackId"]
+
+    repeated_rating = client.put(
+        f"/api/v1/messages/{assistant['id']}/rating",
+        headers=headers,
+        json={"value": "unhelpful"},
+    )
+    assert repeated_rating.status_code == 200
+    conversation_detail = client.get(f"/api/v1/conversations/{conversation_id}", headers=headers)
+    assert conversation_detail.status_code == 200
+    rated_answer = next(
+        item for item in conversation_detail.json()["data"]["messages"]
+        if item["id"] == assistant["id"]
+    )
+    assert rated_answer["rating"]["value"] == "unhelpful"
+    assert rated_answer["citations"][0]["documentName"] == "奖学金管理办法"
+    assert rated_answer["downloadableDocuments"][0]["fileName"] == "奖学金办法.txt"
+    with SessionMaker() as db:
+        saved_ratings = db.scalars(
+            select(MessageRating).where(MessageRating.message_id == uuid.UUID(assistant["id"]))
+        ).all()
+        assert len(saved_ratings) == 1
 
     reprocess = client.post(
         f"/api/v1/admin/documents/{document.id}/reprocess",
@@ -274,6 +313,94 @@ def test_conversation_message_rag_and_rating(test_context):
         assert versions[1].is_current is False
         assert versions[1].process_status == "pending"
         assert versions[1].file_id == versions[0].file_id
+
+
+def test_normal_user_can_download_document_cited_in_own_answer(test_context):
+    client, SessionMaker, settings = test_context
+    admin_headers = auth_headers(client)
+    kb_data = create_kb(client, admin_headers)
+    kb_id = uuid.UUID(kb_data["id"])
+    original_file = "普通用户也可以下载问答引用的原文。".encode()
+    get_storage(settings).put("tests/cited-source.txt", original_file, "text/plain")
+
+    with SessionMaker.begin() as db:
+        normal_role = db.scalar(select(Role).where(Role.code == "normal_user"))
+        uploader = db.scalar(select(User).where(User.account == "2026000001"))
+        reader = User(
+            account="citation-reader",
+            password_hash=hash_password("ReaderPass!2026"),
+            name="普通问答用户",
+            user_type="student",
+            status="active",
+            auth_source="local",
+            roles=[normal_role],
+        )
+        db.add(reader)
+        stored = StoredFile(
+            storage_key="tests/cited-source.txt",
+            original_name="问答引用原文.txt",
+            mime_type="text/plain",
+            size_bytes=len(original_file),
+            sha256="c" * 64,
+            scan_status="clean",
+            uploaded_by=uploader.id,
+        )
+        db.add(stored)
+        db.flush()
+        document = Document(
+            knowledge_base_id=kb_id,
+            display_name="问答引用原文",
+            status="ready",
+            enabled=True,
+            uploaded_by=uploader.id,
+        )
+        db.add(document)
+        db.flush()
+        version = DocumentVersion(
+            document_id=document.id,
+            version_no=1,
+            file_id=stored.id,
+            is_current=True,
+            process_status="ready",
+        )
+        db.add(version)
+        db.flush()
+        document.current_version_id = version.id
+        db.add(
+            DocumentChunk(
+                document_version_id=version.id,
+                chunk_index=0,
+                content="普通用户在问答后可以下载回答所引用的相关原文件。",
+                search_tokens="普通用户 问答 下载 引用 原文件",
+                token_count=16,
+                vector_status="ready",
+                content_hash="d" * 64,
+                section="下载说明",
+            )
+        )
+        document_id = document.id
+
+    signed_in = login(client, password="ReaderPass!2026", account="citation-reader")
+    assert signed_in.status_code == 200, signed_in.text
+    reader_headers = {"Authorization": f"Bearer {signed_in.json()['data']['accessToken']}"}
+    conversation = client.post("/api/v1/conversations", headers=reader_headers, json={})
+    assert conversation.status_code == 201, conversation.text
+    answer = client.post(
+        f"/api/v1/conversations/{conversation.json()['data']['id']}/messages",
+        headers=reader_headers,
+        json={"content": "普通用户能下载问答引用的原文件吗？", "clientRequestId": "reader-download-0001"},
+    )
+    assert answer.status_code == 202, answer.text
+    citation = answer.json()["data"]["assistantMessage"]["citations"][0]
+
+    # The broad document endpoint remains ACL-protected; the answer's citation
+    # link is the proof that this user may download this specific source.
+    assert client.get(f"/api/v1/documents/{document_id}/download", headers=reader_headers).status_code == 404
+    downloaded = client.get(citation["downloadUrl"], headers=reader_headers)
+    assert downloaded.status_code == 200, downloaded.text
+    assert downloaded.content == original_file
+    assert "attachment" in downloaded.headers["content-disposition"]
+    assert client.get(citation["downloadUrl"], headers=admin_headers).status_code == 404
 
 
 def test_admin_student_create_forces_first_login_password_change(test_context):

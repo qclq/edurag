@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import mimetypes
 import re
 import uuid
+import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -11,7 +13,7 @@ from typing import Any
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.api.deps import is_super_admin
+from app.api.deps import is_super_admin, permission_codes
 from app.core.config import Settings
 from app.core.errors import AppError
 from app.core.security import utcnow
@@ -35,10 +37,86 @@ from app.modules.users.models import User
 
 MIME_BY_EXTENSION = {
     "pdf": "application/pdf",
+    "doc": "application/msword",
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "docm": "application/vnd.ms-word.document.macroenabled.12",
+    "rtf": "application/rtf",
+    "xls": "application/vnd.ms-excel",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "xlsm": "application/vnd.ms-excel.sheet.macroenabled.12",
+    "xlsb": "application/vnd.ms-excel.sheet.binary.macroenabled.12",
+    "ppt": "application/vnd.ms-powerpoint",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "pptm": "application/vnd.ms-powerpoint.presentation.macroenabled.12",
+    "odt": "application/vnd.oasis.opendocument.text",
+    "ods": "application/vnd.oasis.opendocument.spreadsheet",
+    "odp": "application/vnd.oasis.opendocument.presentation",
+    "csv": "text/csv",
     "txt": "text/plain",
     "md": "text/markdown",
 }
+
+OOXML_REQUIRED_MEMBER = {
+    "docx": "word/document.xml",
+    "docm": "word/document.xml",
+    "xlsx": "xl/workbook.xml",
+    "xlsm": "xl/workbook.xml",
+    "xlsb": "xl/workbook.bin",
+    "pptx": "ppt/presentation.xml",
+    "pptm": "ppt/presentation.xml",
+}
+
+OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+OLE_REQUIRED_STREAM = {
+    "doc": ("WordDocument",),
+    "xls": ("Workbook", "Book"),
+    "ppt": ("PowerPoint Document",),
+}
+
+ODF_MIME_BY_EXTENSION = {
+    "odt": "application/vnd.oasis.opendocument.text",
+    "ods": "application/vnd.oasis.opendocument.spreadsheet",
+    "odp": "application/vnd.oasis.opendocument.presentation",
+}
+
+
+def _validate_ooxml(content: bytes, extension: str, max_file_mb: int) -> None:
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            names = set(archive.namelist())
+            if OOXML_REQUIRED_MEMBER[extension] not in names:
+                raise AppError(415, "UPLOAD_CONTENT_MISMATCH", f"文件内容与 {extension.upper()} 扩展名不匹配")
+            # Compressed OOXML can otherwise expand far beyond the upload limit.
+            expanded_size = sum(item.file_size for item in archive.infolist())
+            if expanded_size > max(max_file_mb * 20, 200) * 1024 * 1024:
+                raise AppError(413, "UPLOAD_ARCHIVE_TOO_LARGE", "Office 文档解压后体积超过安全限制")
+    except AppError:
+        raise
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise AppError(415, "UPLOAD_CONTENT_MISMATCH", f"{extension.upper()} 文件损坏或格式不正确") from exc
+
+
+def _validate_legacy_ole(content: bytes, extension: str) -> None:
+    markers = OLE_REQUIRED_STREAM[extension]
+    has_stream = any(marker.encode("utf-16le") in content for marker in markers)
+    if not content.startswith(OLE_MAGIC) or not has_stream:
+        raise AppError(415, "UPLOAD_CONTENT_MISMATCH", f"文件内容与 {extension.upper()} 扩展名不匹配")
+
+
+def _validate_odf(content: bytes, extension: str, max_file_mb: int) -> None:
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            if archive.read("mimetype").decode("ascii") != ODF_MIME_BY_EXTENSION[extension]:
+                raise AppError(415, "UPLOAD_CONTENT_MISMATCH", f"文件内容与 {extension.upper()} 扩展名不匹配")
+            if "content.xml" not in archive.namelist():
+                raise AppError(415, "UPLOAD_CONTENT_MISMATCH", f"{extension.upper()} 文件缺少正文内容")
+            expanded_size = sum(item.file_size for item in archive.infolist())
+            if expanded_size > max(max_file_mb * 20, 200) * 1024 * 1024:
+                raise AppError(413, "UPLOAD_ARCHIVE_TOO_LARGE", "Office 文档解压后体积超过安全限制")
+    except AppError:
+        raise
+    except (KeyError, UnicodeDecodeError, zipfile.BadZipFile, OSError) as exc:
+        raise AppError(415, "UPLOAD_CONTENT_MISMATCH", f"{extension.upper()} 文件损坏或格式不正确") from exc
 
 
 def _validate_file(name: str, content: bytes, settings: Settings) -> tuple[str, str]:
@@ -54,9 +132,15 @@ def _validate_file(name: str, content: bytes, settings: Settings) -> tuple[str, 
         raise AppError(413, "UPLOAD_TOO_LARGE", "文件大小超过限制")
     if extension == "pdf" and not content.startswith(b"%PDF-"):
         raise AppError(415, "UPLOAD_CONTENT_MISMATCH", "文件内容与 PDF 扩展名不匹配")
-    if extension == "docx" and not content.startswith(b"PK"):
-        raise AppError(415, "UPLOAD_CONTENT_MISMATCH", "文件内容与 DOCX 扩展名不匹配")
-    if extension in {"txt", "md"}:
+    if extension in OOXML_REQUIRED_MEMBER:
+        _validate_ooxml(content, extension, settings.upload_max_file_mb)
+    if extension in OLE_REQUIRED_STREAM:
+        _validate_legacy_ole(content, extension)
+    if extension in ODF_MIME_BY_EXTENSION:
+        _validate_odf(content, extension, settings.upload_max_file_mb)
+    if extension == "rtf" and not content.lstrip().startswith(b"{\\rtf"):
+        raise AppError(415, "UPLOAD_CONTENT_MISMATCH", "文件内容与 RTF 扩展名不匹配")
+    if extension in {"txt", "md", "csv"}:
         try:
             content.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -205,8 +289,11 @@ def create_ingestions(db: Session, user: User, payload: IngestionCreate):
 
 
 def document_acl_allows(db: Session, document: Document, user: User, action: str) -> bool:
-    if action != "download" and can_access(document.knowledge_base, user, "manage"):
-        return True
+    if can_access(document.knowledge_base, user, "manage"):
+        if action != "download":
+            return True
+        if is_super_admin(user) or "document.download" in permission_codes(user):
+            return True
     if not can_access(document.knowledge_base, user, action):
         return False
     entries = db.scalars(select(DocumentAclEntry).where(DocumentAclEntry.document_id == document.id)).all()
@@ -274,6 +361,9 @@ def document_payload(db: Session, document: Document, *, detailed: bool = False)
         "enabled": document.enabled,
         "tags": [tag.name for tag in document.tags],
         "chunkCount": chunk_count,
+        "fileName": current.file.original_name if current else None,
+        "mimeType": current.file.mime_type if current else None,
+        "downloadUrl": f"/api/v1/documents/{document.id}/download" if current else None,
         "currentVersionId": str(current.id) if current else None,
         "version": document.row_version,
         "createdAt": document.created_at,

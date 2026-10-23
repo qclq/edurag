@@ -32,13 +32,16 @@ TERMINAL_MESSAGE_STATUSES = {"completed", "no_answer", "stopped", "failed"}
 
 
 def citation_payload(citation: MessageCitation, *, document_name: str | None = None) -> dict[str, Any]:
+    resolved_document_name = document_name or getattr(getattr(citation, "document", None), "display_name", None)
     return {
         "id": str(citation.id),
         "index": citation.citation_index,
         "documentId": str(citation.document_id),
         "documentVersionId": str(citation.document_version_id),
         "chunkId": str(citation.chunk_id),
-        "documentName": document_name,
+        "previewUrl": f"/api/v1/documents/{citation.document_id}/preview?chunkId={citation.chunk_id}",
+        "downloadUrl": f"/api/v1/citations/{citation.id}/download",
+        "documentName": resolved_document_name,
         "quote": citation.quote,
         "pageStart": citation.page_start,
         "pageEnd": citation.page_end,
@@ -48,7 +51,38 @@ def citation_payload(citation: MessageCitation, *, document_name: str | None = N
     }
 
 
-def message_payload(message: Message, *, include_citations: bool = True) -> dict[str, Any]:
+def downloadable_documents_payload(citations: list[MessageCitation]) -> list[dict[str, Any]]:
+    documents: list[dict[str, Any]] = []
+    seen_document_ids: set[uuid.UUID] = set()
+    for citation in citations:
+        if citation.document_id in seen_document_ids:
+            continue
+        seen_document_ids.add(citation.document_id)
+        document = getattr(citation, "document", None)
+        version = getattr(citation, "document_version", None)
+        file = getattr(version, "file", None)
+        document_name = getattr(document, "display_name", None) or getattr(file, "original_name", None)
+        documents.append(
+            {
+                "documentId": str(citation.document_id),
+                "documentName": document_name,
+                "fileName": getattr(file, "original_name", None) or document_name,
+                "downloadUrl": f"/api/v1/citations/{citation.id}/download",
+            }
+        )
+    return documents
+
+
+def message_payload(
+    message: Message,
+    *,
+    include_citations: bool = True,
+    viewer_id: uuid.UUID | None = None,
+) -> dict[str, Any]:
+    viewer_rating = next(
+        (rating for rating in getattr(message, "ratings", []) if rating.user_id == viewer_id),
+        None,
+    ) if viewer_id else None
     data: dict[str, Any] = {
         "id": str(message.id),
         "conversationId": str(message.conversation_id),
@@ -68,15 +102,26 @@ def message_payload(message: Message, *, include_citations: bool = True) -> dict
             "totalMs": message.total_ms,
         },
         "modelName": message.model_name,
+        "rating": {
+            "value": viewer_rating.value,
+            "reason": viewer_rating.reason,
+            "comment": viewer_rating.comment,
+        } if viewer_rating else None,
         "createdAt": message.created_at,
         "completedAt": message.completed_at,
     }
     if include_citations:
         data["citations"] = [citation_payload(item) for item in message.citations]
+        data["downloadableDocuments"] = downloadable_documents_payload(message.citations)
     return data
 
 
-def conversation_payload(conversation: Conversation, *, include_messages: bool = False) -> dict[str, Any]:
+def conversation_payload(
+    conversation: Conversation,
+    *,
+    include_messages: bool = False,
+    viewer_id: uuid.UUID | None = None,
+) -> dict[str, Any]:
     result: dict[str, Any] = {
         "id": str(conversation.id),
         "title": conversation.title,
@@ -91,7 +136,7 @@ def conversation_payload(conversation: Conversation, *, include_messages: bool =
         "updatedAt": conversation.updated_at,
     }
     if include_messages:
-        result["messages"] = [message_payload(item) for item in conversation.messages]
+        result["messages"] = [message_payload(item, viewer_id=viewer_id) for item in conversation.messages]
     return result
 
 
@@ -101,6 +146,7 @@ def get_conversation_or_404(db: Session, conversation_id, user: User) -> Convers
         .options(
             selectinload(Conversation.knowledge_bases),
             selectinload(Conversation.messages).selectinload(Message.citations),
+            selectinload(Conversation.messages).selectinload(Message.ratings),
         )
         .where(
             Conversation.id == conversation_id,

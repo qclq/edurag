@@ -37,6 +37,8 @@ class ProcessingTask(Base):
 
     events: Mapped[list["TaskEvent"]] = relationship(back_populates="task", cascade="all, delete-orphan", order_by="TaskEvent.sequence")
     items: Mapped[list["TaskItem"]] = relationship(back_populates="task", cascade="all, delete-orphan")
+    document = relationship("Document", foreign_keys=[document_id], lazy="joined")
+    document_version = relationship("DocumentVersion", foreign_keys=[document_version_id], lazy="joined")
 
 
 class TaskItem(Base):

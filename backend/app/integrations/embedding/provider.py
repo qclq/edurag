@@ -59,8 +59,21 @@ def _qwen_batch(texts: list[str], settings: Settings) -> list[list[float]]:
         )
         response.raise_for_status()
         payload = response.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        raise EmbeddingProviderError("EMBEDDING_PROVIDER_ERROR", "Qwen Embedding 调用失败") from exc
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status in {401, 403}:
+            raise EmbeddingProviderError("EMBEDDING_AUTH_ERROR", f"Qwen Embedding 鉴权失败（HTTP {status}），请检查 API Key 与模型地域") from exc
+        if status == 404:
+            raise EmbeddingProviderError("EMBEDDING_PROVIDER_NOT_FOUND", "Qwen Embedding 模型或接口不可用（HTTP 404）") from exc
+        if status == 429:
+            raise EmbeddingProviderError("EMBEDDING_RATE_LIMITED", "Qwen Embedding 请求受限（HTTP 429），请检查账户额度或稍后重试") from exc
+        raise EmbeddingProviderError("EMBEDDING_PROVIDER_ERROR", f"Qwen Embedding 服务调用失败（HTTP {status}）") from exc
+    except httpx.TimeoutException as exc:
+        raise EmbeddingProviderError("EMBEDDING_TIMEOUT", "Qwen Embedding 请求超时，请稍后重试") from exc
+    except httpx.HTTPError as exc:
+        raise EmbeddingProviderError("EMBEDDING_CONNECTION_ERROR", "无法连接 Qwen Embedding 服务，请检查网络与接口地址") from exc
+    except ValueError as exc:
+        raise EmbeddingProviderError("EMBEDDING_RESPONSE_INVALID", "Qwen Embedding 返回格式不正确") from exc
     try:
         ordered = sorted(payload["data"], key=lambda item: item["index"])
         vectors = [item["embedding"] for item in ordered]

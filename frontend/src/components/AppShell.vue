@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
   Bell, ChatDotRound, Clock, Collection, DataAnalysis, Document,
-  Fold, House, Menu, Search, Switch, User, UserFilled,
+  EditPen, Fold, House, Menu, Search, Switch, User, UserFilled,
 } from '@element-plus/icons-vue'
 import { authenticatedRequest, logout, removeCurrentUserAvatar, uploadCurrentUserAvatar, useAuth } from '../stores/auth'
 
@@ -25,6 +25,9 @@ const avatarFileInput = ref(null)
 const avatarFile = ref(null)
 const avatarPreviewUrl = ref('')
 const avatarSaving = ref(false)
+const feedbackOpen = ref(false)
+const feedbackSaving = ref(false)
+const feedbackForm = ref({ type: 'suggestion', comment: '' })
 
 const baseGroups = [
   {
@@ -187,6 +190,30 @@ const clearAvatar = async () => {
   }
 }
 
+const openFeedback = () => {
+  feedbackForm.value = { type: 'suggestion', comment: '' }
+  feedbackOpen.value = true
+  mobileOpen.value = false
+}
+
+const submitFeedback = async () => {
+  const comment = feedbackForm.value.comment.trim()
+  if (comment.length < 2) return ElMessage.warning('请至少填写 2 个字的反馈内容')
+  feedbackSaving.value = true
+  try {
+    await authenticatedRequest('/feedbacks', {
+      method: 'POST',
+      body: { ...feedbackForm.value, comment, pagePath: route.fullPath },
+    })
+    ElMessage.success('反馈已提交，感谢你的建议')
+    feedbackOpen.value = false
+  } catch (error) {
+    ElMessage.error(error.message || '反馈提交失败')
+  } finally {
+    feedbackSaving.value = false
+  }
+}
+
 onMounted(loadNotifications)
 </script>
 
@@ -227,6 +254,7 @@ onMounted(loadNotifications)
       </div>
 
       <div class="side-bottom">
+        <button class="nav-item logout-item feedback-entry" type="button" @click="openFeedback"><el-icon><EditPen /></el-icon><span>意见反馈</span></button>
         <button class="nav-item logout-item" type="button" @click="doLogout"><el-icon><Switch /></el-icon><span>退出登录</span></button>
       </div>
     </aside>
@@ -266,5 +294,29 @@ onMounted(loadNotifications)
         <el-button class="primary-btn" :loading="avatarSaving" :disabled="!avatarFile" @click="saveAvatar">保存头像</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="feedbackOpen" title="意见反馈" width="520" align-center append-to-body>
+      <div class="feedback-form">
+        <p>遇到问题或有改进建议，都可以直接告诉我们。管理员会在反馈中心跟进。</p>
+        <label>反馈类型</label>
+        <el-select v-model="feedbackForm.type" style="width:100%">
+          <el-option label="功能建议" value="suggestion" />
+          <el-option label="系统故障" value="bug" />
+          <el-option label="内容问题" value="content" />
+          <el-option label="其他" value="other" />
+        </el-select>
+        <label>反馈内容</label>
+        <el-input v-model="feedbackForm.comment" type="textarea" :rows="6" maxlength="5000" show-word-limit placeholder="请描述遇到的问题、期望结果或改进建议" />
+        <small>当前页面：{{ route.fullPath }}</small>
+      </div>
+      <template #footer>
+        <el-button @click="feedbackOpen=false">取消</el-button>
+        <el-button class="primary-btn" :loading="feedbackSaving" :disabled="feedbackForm.comment.trim().length < 2" @click="submitFeedback">提交反馈</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
+
+<style scoped>
+.feedback-entry{margin-bottom:3px;color:#0051d5}.feedback-form{display:grid;gap:10px}.feedback-form p{margin:0 0 4px;color:#64748b;font-size:12px;line-height:1.7}.feedback-form label{margin-top:4px;color:#334155;font-size:11px;font-weight:700}.feedback-form small{color:#94a3b8;font-size:9px}
+</style>

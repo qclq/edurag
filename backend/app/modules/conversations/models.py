@@ -60,6 +60,7 @@ class Message(Base):
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
     events: Mapped[list["MessageEvent"]] = relationship(back_populates="message", cascade="all, delete-orphan", order_by="MessageEvent.sequence")
     citations: Mapped[list["MessageCitation"]] = relationship(back_populates="message", cascade="all, delete-orphan", order_by="MessageCitation.citation_index")
+    ratings: Mapped[list["MessageRating"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
 
 
 class MessageEvent(Base):
@@ -96,6 +97,8 @@ class MessageCitation(Base):
     rerank_score: Mapped[float | None] = mapped_column(Float)
 
     message: Mapped[Message] = relationship(back_populates="citations")
+    document = relationship("Document", lazy="joined")
+    document_version = relationship("DocumentVersion", lazy="joined")
 
 
 class MessageRating(Base):

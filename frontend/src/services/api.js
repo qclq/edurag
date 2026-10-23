@@ -1,7 +1,9 @@
+import { joinApiUrl } from './api-url'
+
 export const API_PREFIX = (import.meta.env.VITE_API_BASE_URL || '/api/v1').replace(/\/$/, '')
 
 export function apiUrl(path) {
-  return `${API_PREFIX}${path.startsWith('/') ? path : `/${path}`}`
+  return joinApiUrl(API_PREFIX, path)
 }
 
 export class ApiError extends Error {

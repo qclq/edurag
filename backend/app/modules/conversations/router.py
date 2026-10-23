@@ -105,7 +105,14 @@ def get_conversation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    return success(request, conversation_payload(get_conversation_or_404(db, conversation_id, user), include_messages=True))
+    return success(
+        request,
+        conversation_payload(
+            get_conversation_or_404(db, conversation_id, user),
+            include_messages=True,
+            viewer_id=user.id,
+        ),
+    )
 
 
 @router.patch("/conversations/{conversation_id}", summary="更新会话")
@@ -171,7 +178,7 @@ def list_messages(
     conversation = get_conversation_or_404(db, conversation_id, user)
     statement = (
         select(Message)
-        .options(selectinload(Message.citations))
+        .options(selectinload(Message.citations), selectinload(Message.ratings))
         .where(Message.conversation_id == conversation.id)
         .order_by(Message.created_at, Message.id)
         .offset(cursor)
@@ -180,7 +187,13 @@ def list_messages(
     items = db.scalars(statement).unique().all()
     has_more = len(items) > limit
     items = items[:limit]
-    return success(request, {"items": [message_payload(item) for item in items], "nextCursor": cursor + limit if has_more else None})
+    return success(
+        request,
+        {
+            "items": [message_payload(item, viewer_id=user.id) for item in items],
+            "nextCursor": cursor + limit if has_more else None,
+        },
+    )
 
 
 @router.post("/conversations/{conversation_id}/messages", status_code=202, summary="发送消息")

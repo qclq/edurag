@@ -45,8 +45,37 @@ class Settings(BaseSettings):
     question_max_length: int = 500
     upload_max_file_mb: int = 50
     upload_max_files: int = 20
-    upload_extensions: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["pdf", "docx", "txt", "md"])
+    upload_extensions: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: [
+            "pdf",
+            "doc",
+            "docx",
+            "docm",
+            "rtf",
+            "xls",
+            "xlsx",
+            "xlsm",
+            "xlsb",
+            "csv",
+            "ppt",
+            "pptx",
+            "pptm",
+            "odt",
+            "ods",
+            "odp",
+            "txt",
+            "md",
+        ]
+    )
     upload_ttl_hours: int = 24
+
+    libreoffice_binary: str = "soffice"
+    office_conversion_timeout_seconds: float = Field(default=120.0, gt=0)
+
+    qwen_ocr_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    qwen_ocr_model: str = "qwen-vl-ocr"
+    qwen_ocr_timeout_seconds: float = Field(default=90.0, gt=0)
+    qwen_ocr_max_images_per_document: int = Field(default=200, ge=1, le=2000)
 
     storage_backend: Literal["local", "s3"] = "local"
     storage_local_path: str = "./data/files"

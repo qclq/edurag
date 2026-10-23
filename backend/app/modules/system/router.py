@@ -1,3 +1,6 @@
+import shutil
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -9,6 +12,10 @@ from app.db.session import get_db
 
 
 router = APIRouter()
+
+
+def _office_converter_available(binary: str) -> bool:
+    return bool(shutil.which(binary) or Path(binary).is_file())
 
 
 @router.get("/bootstrap", summary="读取公开系统启动配置")
@@ -59,6 +66,16 @@ def bootstrap(request: Request, settings: Settings = Depends(get_settings)):
                     "provider": settings.embedding_provider,
                     "model": settings.embedding_model,
                     "configured": settings.embedding_provider == "local" or bool(settings.qwen_api_key),
+                },
+                "ocr": {
+                    "provider": "qwen",
+                    "model": settings.qwen_ocr_model,
+                    "configured": bool(settings.qwen_api_key),
+                },
+                "officeConverter": {
+                    "provider": "libreoffice",
+                    "binary": settings.libreoffice_binary,
+                    "configured": _office_converter_available(settings.libreoffice_binary),
                 },
                 "answering": {
                     "provider": settings.llm_provider,

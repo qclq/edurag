@@ -58,7 +58,7 @@ def upload_config(
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ):
-    defaults = {"ocrEnabled": False, "chunkSize": 800, "chunkOverlap": 100}
+    defaults = {"ocrEnabled": True, "chunkSize": 800, "chunkOverlap": 100}
     if knowledge_base_id:
         kb = get_kb_or_404(db, knowledge_base_id)
         if not can_access(kb, user, "manage"):
@@ -71,6 +71,14 @@ def upload_config(
             "maxFileSizeBytes": settings.upload_max_file_mb * 1024 * 1024,
             "maxFiles": settings.upload_max_files,
             "categories": ["规章制度", "办事指南", "通知公告", "教学资料", "其他"],
+            "formatGroups": {
+                "Word": ["doc", "docx", "docm", "rtf", "odt"],
+                "Excel": ["xls", "xlsx", "xlsm", "xlsb", "csv", "ods"],
+                "PDF": ["pdf"],
+                "PowerPoint": ["ppt", "pptx", "pptm", "odp"],
+                "Markdown": ["md"],
+                "Text": ["txt"],
+            },
             "defaults": defaults,
         },
     )
@@ -228,6 +236,7 @@ def new_version(
         version_no=version_no,
         file_id=upload.file_id,
         process_status="pending",
+        ocr_enabled=True,
         chunk_size=document.knowledge_base.chunk_size,
         chunk_overlap=document.knowledge_base.chunk_overlap,
     )

@@ -40,6 +40,8 @@ Copy-Item .env.docker.example .env
 默认模型链路：
 
 - Qwen `text-embedding-v4`（1024 维）负责文档和查询向量化；
+- Qwen `qwen-vl-ocr-latest` 识别 PDF、PPTX、DOCX 中的图片文字，之后再进入文本切分和向量化；
+- LibreOffice 无界面转换兼容 DOC、XLS、PPT、RTF、XLSB 与 OpenDocument 格式，原始上传文件仍作为下载原件保留；
 - Milvus alias `edurag_chunks_current` 保存/查询派生向量；
 - DeepSeek `deepseek-flash` 负责基于受权切片生成带引用回答；
 - PostgreSQL 始终保存正文、权限、任务事件和回答事实数据。

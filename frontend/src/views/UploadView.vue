@@ -6,13 +6,13 @@ import { ArrowLeft, Check, Close, Document, Files, InfoFilled, Refresh, Setting,
 import StatusPill from '../components/StatusPill.vue'
 import QuickKnowledgeBaseDialog from '../components/QuickKnowledgeBaseDialog.vue'
 import { authenticatedRequest, useAuth } from '../stores/auth'
+import { shouldEnableUploadOcr } from '../utils/upload-ocr'
 
 const { state } = useAuth()
 const router = useRouter()
 const route = useRoute()
 const files = ref([])
 const knowledgeBases = ref([])
-const departments = ref([])
 const tasks = ref([])
 const mode = ref('上传文档')
 const submitting = ref(false)
@@ -20,29 +20,46 @@ const pageLoading = ref(false)
 const loadError = ref('')
 const uploadRef = ref(null)
 const createKbOpen = ref(false)
-const config = ref({ kb:'', category:'规章制度', department:'', number:'', effective:'', ocr:true, vectorize:true, chunk:512, overlap:64 })
+const config = ref({ kb:'', category:'规章制度', number:'', ocr:false, vectorize:true, chunk:512, overlap:64 })
 const serverUploadConfig = ref(null)
 const uploadLimits = computed(() => serverUploadConfig.value || state.bootstrap?.uploadLimits || {})
 const maxFiles = computed(() => uploadLimits.value.maxFiles || 20)
 const maxFileSizeBytes = computed(() => uploadLimits.value.maxFileSizeBytes || 50 * 1024 * 1024)
-const allowedExtensions = computed(() => uploadLimits.value.allowedExtensions || ['pdf', 'docx', 'txt', 'md'])
-const accept = computed(() => (uploadLimits.value.allowedExtensions || ['pdf', 'docx', 'txt', 'md']).map(item => `.${item}`).join(','))
+const defaultExtensions = ['pdf', 'doc', 'docx', 'docm', 'rtf', 'xls', 'xlsx', 'xlsm', 'xlsb', 'csv', 'ppt', 'pptx', 'pptm', 'odt', 'ods', 'odp', 'md', 'txt']
+const defaultFormatGroups = {
+  Word: ['doc', 'docx', 'docm', 'rtf', 'odt'],
+  Excel: ['xls', 'xlsx', 'xlsm', 'xlsb', 'csv', 'ods'],
+  PDF: ['pdf'],
+  PowerPoint: ['ppt', 'pptx', 'pptm', 'odp'],
+  Markdown: ['md'],
+  Text: ['txt'],
+}
+const allowedExtensions = computed(() => uploadLimits.value.allowedExtensions || defaultExtensions)
+const formatGroups = computed(() => serverUploadConfig.value?.formatGroups || defaultFormatGroups)
+const accept = computed(() => (uploadLimits.value.allowedExtensions || defaultExtensions).map(item => `.${item}`).join(','))
 const uploadLimitText = computed(() => {
-  const extensions = (uploadLimits.value.allowedExtensions || ['pdf', 'docx', 'txt', 'md']).map(item => item.toUpperCase()).join(', ')
-  return `支持 ${extensions}（单个文件最大 ${Math.round(maxFileSizeBytes.value / 1024 / 1024)}MB，单次最多 ${maxFiles.value} 个）`
+  return `支持 Word、Excel、PDF、PowerPoint、Markdown 等格式（单个文件最大 ${Math.round(maxFileSizeBytes.value / 1024 / 1024)}MB，单次最多 ${maxFiles.value} 个）`
 })
 const totalSize = computed(() => {
   const bytes = files.value.reduce((sum, file) => sum + file.sizeBytes, 0)
   if (bytes === 0) return '0 MB'
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`
 })
+const taskStatusLabel = status => ({
+  queued: '等待处理',
+  running: '处理中',
+  succeeded: '已完成',
+  failed: '失败',
+  cancelled: '已取消',
+  partial_success: '部分完成',
+})[status] || status
+const syncOcrWithFiles = () => { config.value.ocr = shouldEnableUploadOcr(files.value) }
 const loadPage = async () => {
   pageLoading.value = true
   loadError.value = ''
   const results = await Promise.allSettled([
     authenticatedRequest('/admin/document-upload-config'),
     authenticatedRequest('/admin/knowledge-bases?pageSize=100', { includeEnvelope: true }),
-    authenticatedRequest('/admin/departments'),
     authenticatedRequest('/admin/tasks?pageSize=20', { includeEnvelope: true }),
   ])
   if (results[0].status === 'fulfilled') serverUploadConfig.value = results[0].value
@@ -52,8 +69,7 @@ const loadPage = async () => {
   } else {
     loadError.value = results[1].reason?.message || '可管理知识库加载失败'
   }
-  if (results[2].status === 'fulfilled') departments.value = results[2].value
-  if (results[3].status === 'fulfilled') tasks.value = results[3].value.data || []
+  if (results[2].status === 'fulfilled') tasks.value = results[2].value.data || []
   pageLoading.value = false
 }
 
@@ -88,9 +104,7 @@ const submit = async (saveAsDraft = false) => {
           knowledgeBaseId: config.value.kb,
           displayName: item.name.replace(/\.[^.]+$/, ''),
           category: config.value.category || null,
-          publishDepartmentId: config.value.department || null,
           documentNo: config.value.number || null,
-          effectiveAt: config.value.effective || null,
           tags: [],
         },
       })
@@ -106,6 +120,7 @@ const submit = async (saveAsDraft = false) => {
     await loadTasks({ silent: true })
     uploadRef.value?.clearFiles()
     files.value = []
+    syncOcrWithFiles()
     if (saveAsDraft) await router.push('/admin/document')
     else mode.value = '任务中心'
   } catch (error) {
@@ -173,14 +188,17 @@ const handleUpload = (file) => {
     fingerprint,
     clientFileId: crypto.randomUUID?.() || `web-${Date.now()}-${Math.random().toString(16).slice(2)}`,
     sizeBytes,
+    extension,
     size: `${(sizeBytes / 1024 / 1024).toFixed(1)} MB`,
     state: 'pending',
     detail: '已选择，等待上传',
   })
+  syncOcrWithFiles()
 }
 
 const removeFile = async (index) => {
   const [item] = files.value.splice(index, 1)
+  syncOcrWithFiles()
   if (item?.uploadFile) uploadRef.value?.handleRemove(item.uploadFile)
   if (item?.uploadId && item.state !== 'submitted') {
     try { await authenticatedRequest(`/admin/uploads/${item.uploadId}`, { method: 'DELETE' }) } catch { /* The pending upload may already be unavailable. */ }
@@ -192,6 +210,7 @@ const clearQueue = async () => {
   const pending = files.value.filter(item => item.uploadId && item.state !== 'submitted')
   await Promise.allSettled(pending.map(item => authenticatedRequest(`/admin/uploads/${item.uploadId}`, { method: 'DELETE' })))
   files.value = []
+  syncOcrWithFiles()
   uploadRef.value?.clearFiles()
 }
 
@@ -224,7 +243,7 @@ onBeforeUnmount(() => window.clearInterval(taskPollTimer))
     <div v-if="mode==='上传文档'" class="upload-grid">
       <section class="upload-left">
         <el-upload ref="uploadRef" class="dropzone" drag action="#" multiple :limit="maxFiles" :auto-upload="false" :show-file-list="false" :on-change="handleUpload" :on-exceed="() => ElMessage.warning(`单次最多选择 ${maxFiles} 个文件`)" :accept="accept">
-          <el-icon class="upload-icon"><UploadFilled /></el-icon><h3>点击上传或将文件拖拽至此处</h3><p>{{uploadLimitText}}</p><el-button class="primary-btn" :icon="Files">选取本地文件</el-button><div class="file-types"><i v-for="extension in uploadLimits.allowedExtensions || ['pdf','docx','txt','md']" :key="extension">{{extension.toUpperCase()}}</i></div>
+          <el-icon class="upload-icon"><UploadFilled /></el-icon><h3>点击上传或将文件拖拽至此处</h3><p>{{uploadLimitText}}</p><el-button class="primary-btn" :icon="Files">选取本地文件</el-button><div class="file-types"><i v-for="(extensions,label) in formatGroups" :key="label" :title="extensions.map(item => `.${item}`).join('、')">{{label}}</i></div>
         </el-upload>
 
         <section class="queue panel panel-pad">
@@ -243,17 +262,35 @@ onBeforeUnmount(() => window.clearInterval(taskPollTimer))
           <el-alert v-else-if="!pageLoading && !knowledgeBases.length" class="upload-blocker" title="尚未创建可管理的知识库，文件无法确定入库位置。" type="warning" show-icon :closable="false"><template #default><el-button link type="primary" @click="createKbOpen = true">立即创建首个知识库</el-button></template></el-alert>
           <el-form-item label="目标知识库 *"><el-select v-model="config.kb" style="width:100%" :loading="pageLoading" :disabled="knowledgeBases.length === 0" placeholder="暂无可管理知识库"><el-option v-for="item in knowledgeBases" :key="item.id" :label="item.name" :value="item.id" /></el-select><small>仅显示当前账号可管理的知识库　<el-button link type="primary" @click="createKbOpen = true">新建知识库</el-button></small></el-form-item>
           <el-form-item label="业务分类 *"><el-radio-group v-model="config.category" class="category-radios"><el-radio-button value="规章制度">规章制度<small>条例、细则、办法</small></el-radio-button><el-radio-button value="办事指南">办事指南<small>办事流程、服务指引</small></el-radio-button><el-radio-button value="通知公告">通知公告<small>时效性发布、通知</small></el-radio-button><el-radio-button value="表格模板">表格模板<small>申请单、填报标准</small></el-radio-button></el-radio-group></el-form-item>
-          <div class="form-two"><el-form-item label="责任发布部门 *"><el-select v-model="config.department" :disabled="departments.length === 0" placeholder="暂无部门数据"><el-option v-for="item in departments" :key="item.id" :label="item.name" :value="item.id" /></el-select></el-form-item><el-form-item label="正式发文编号"><el-input v-model="config.number" placeholder="请输入正式发文编号"/></el-form-item></div>
-          <el-form-item label="生效日期"><el-date-picker v-model="config.effective" type="date" value-format="YYYY-MM-DD" style="width:100%" /></el-form-item>
+          <el-form-item label="正式发文编号"><el-input v-model="config.number" placeholder="请输入正式发文编号"/></el-form-item>
           <div class="advanced-title"><el-icon><Setting /></el-icon><b>高级解析与切片参数 (RAG Pipeline)</b></div>
-          <div class="switch-setting"><div><b>开启智能 OCR 解析</b><small>自动识别扫描件公章、嵌入图表和手写文字</small></div><el-switch v-model="config.ocr" /></div>
+          <div class="switch-setting"><div><b>开启 Qwen OCR 图片解析</b><small>默认关闭；选择 PDF、PPT、Word 等可能含图片的文档时自动开启，也可手动调整</small></div><el-switch v-model="config.ocr" /></div>
           <div class="slider-grid"><label>切片最大长度 <b>{{config.chunk}} Tokens</b><el-slider v-model="config.chunk" :min="256" :max="1024" :step="64" /></label><label>重叠窗口长度 <b>{{config.overlap}} Tokens</b><el-slider v-model="config.overlap" :min="0" :max="Math.min(256, config.chunk - 16)" :step="16" /></label></div>
           <div class="switch-setting"><div><b>解析完成后自动向量化入库</b><small>处理流水线会使用系统配置的嵌入模型与向量索引服务</small></div><StatusPill tone="success" text="已启用" /></div>
         </el-form>
       </aside>
     </div>
 
-    <section v-else class="panel task-center"><header><div><h2>处理任务</h2><p>每 3 秒自动更新文档解析、切片和向量入库进度</p></div><el-button :icon="Refresh" @click="loadTasks()">刷新</el-button></header><el-table :data="tasks" row-key="id"><el-table-column prop="taskNo" label="任务编号" min-width="170"/><el-table-column prop="type" label="类型" width="155"/><el-table-column label="状态" width="120"><template #default="{row}"><StatusPill :tone="row.status==='succeeded'?'success':row.status==='failed'?'danger':'info'" :text="row.status"/></template></el-table-column><el-table-column label="进度" min-width="220"><template #default="{row}"><el-progress :percentage="row.progressPercent || 0" :status="row.status==='failed'?'exception':row.status==='succeeded'?'success':''"/><small>{{row.progressText || row.error?.message}}</small></template></el-table-column><el-table-column label="创建时间" min-width="160"><template #default="{row}">{{new Date(row.createdAt).toLocaleString('zh-CN')}}</template></el-table-column><el-table-column label="操作" width="150"><template #default="{row}"><el-button v-if="['failed','cancelled'].includes(row.status)" text @click="retryTask(row)">重试</el-button><el-button v-if="!['succeeded','failed','cancelled','partial_success'].includes(row.status)" text type="danger" @click="cancelTask(row)">取消</el-button></template></el-table-column></el-table><el-empty v-if="!tasks.length" description="暂无处理任务" /></section>
+    <section v-else class="panel task-center">
+      <header><div><h2>处理任务</h2><p>每 3 秒自动更新文档解析、切片和向量入库进度；失败任务会显示具体原因和处理建议</p></div><el-button :icon="Refresh" @click="loadTasks()">刷新</el-button></header>
+      <el-table :data="tasks" row-key="id">
+        <el-table-column prop="taskNo" label="任务编号" min-width="190" />
+        <el-table-column label="原文件名" min-width="240"><template #default="{row}"><span class="task-file-name" :title="row.fileName || '非文档任务'">{{ row.fileName || '—' }}</span></template></el-table-column>
+        <el-table-column label="类型" width="90"><template #default="{row}"><span class="file-extension">{{ row.fileExtension || row.typeLabel || row.type }}</span></template></el-table-column>
+        <el-table-column label="状态" width="110"><template #default="{row}"><StatusPill :tone="row.status==='succeeded'?'success':row.status==='failed'?'danger':'info'" :text="taskStatusLabel(row.status)" /></template></el-table-column>
+        <el-table-column label="进度与处理说明" min-width="360"><template #default="{row}">
+          <el-progress :percentage="row.progressPercent || 0" :status="row.status==='failed'?'exception':row.status==='succeeded'?'success':''" />
+          <div v-if="row.status==='failed'" class="task-error-detail">
+            <b>{{ row.error?.message || row.progressText || '任务处理失败' }}</b><code v-if="row.error?.code">{{ row.error.code }}</code>
+            <p>{{ row.error?.action || '请重试；若仍然失败，请将任务编号提供给技术支持。' }}</p>
+          </div>
+          <small v-else>{{ row.progressText || '等待任务更新' }}</small>
+        </template></el-table-column>
+        <el-table-column label="创建时间" min-width="170"><template #default="{row}">{{new Date(row.createdAt).toLocaleString('zh-CN')}}</template></el-table-column>
+        <el-table-column label="操作" width="130"><template #default="{row}"><el-button v-if="['failed','cancelled'].includes(row.status)" text type="primary" @click="retryTask(row)">重试</el-button><el-button v-if="!['succeeded','failed','cancelled','partial_success'].includes(row.status)" text type="danger" @click="cancelTask(row)">取消</el-button></template></el-table-column>
+      </el-table>
+      <el-empty v-if="!tasks.length" description="暂无处理任务" />
+    </section>
 
     <footer v-if="mode==='上传文档'" class="submit-bar panel"><div><StatusPill :text="files.length ? `已选择 ${files.length} 个本地文件` : '等待选择文件'" /><span>文件总大小 {{totalSize}}</span></div><el-button :disabled="files.length === 0 || submitting" @click="clearQueue">取消</el-button><el-button :loading="submitting" :disabled="files.length === 0" @click="submit(true)">保存为草稿</el-button><el-button class="primary-btn" :loading="submitting" :disabled="files.length === 0" @click="submit(false)">{{config.kb ? `确认上传并开始入库处理（${files.length}个文件）` : '先创建知识库再继续'}}</el-button></footer>
     <QuickKnowledgeBaseDialog v-model="createKbOpen" @created="handleKnowledgeBaseCreated" />
@@ -261,9 +298,9 @@ onBeforeUnmount(() => window.clearInterval(taskPollTimer))
 </template>
 
 <style scoped>
-.upload-page{padding-bottom:90px}.upload-head{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:18px}.upload-head>div:first-child>p{display:flex;align-items:center;gap:6px;margin:0 0 7px;color:#94a3b8;font-size:10px}.upload-head>div:first-child>div{display:flex;align-items:baseline;gap:10px}.upload-head h1{margin:0;font-size:26px}.upload-head>div:first-child span{color:#0051d5;font-size:8px;letter-spacing:.08em}.upload-head>div:last-child{display:flex;gap:8px}.upload-grid{display:grid;grid-template-columns:minmax(0,1fr) 420px;gap:17px;align-items:start}.upload-left{min-width:0}.dropzone :deep(.el-upload-dragger){min-height:275px;display:flex;flex-direction:column;align-items:center;justify-content:center;border:2px dashed #bfdbfe;border-radius:16px;background:linear-gradient(140deg,#fff,#f6f9ff)}.upload-icon{font-size:36px;color:#0051d5}.dropzone h3{margin:13px 0 5px;font-size:14px}.dropzone p{margin:0 0 13px;color:#64748b;font-size:9px}.dropzone>span{margin-top:8px;color:#94a3b8;font-size:8px}.file-types{display:flex;gap:7px;margin-top:13px}.file-types i{padding:4px 7px;border-radius:5px;background:#f1f5f9;color:#64748b;font-size:8px;font-style:normal;font-weight:700}.queue{margin-top:14px}.file-row{display:flex;gap:12px;padding:12px 0;border-top:1px solid #eff4ff}.file-icon{width:38px;height:38px;flex:none;display:grid;place-items:center;border-radius:10px}.file-icon.pdf{background:#fef2f2;color:#dc2626}.file-icon.docx{background:#eff4ff;color:#0051d5}.file-copy{min-width:0;flex:1}.file-copy header{display:flex;align-items:center}.file-copy header b{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:10px}.file-meta{display:flex;align-items:center;gap:7px;margin:3px 0 7px;color:#64748b;font-size:8px}.file-copy footer{display:flex;justify-content:space-between;margin-top:5px;color:#059669;font-size:8px}.file-copy footer small{color:#94a3b8}.compliance{display:flex;align-items:center;gap:7px;padding:9px;margin-top:8px;border-radius:8px;background:#ecfdf5;color:#059669;font-size:8px}.compliance b{margin-left:auto;color:#64748b}.tip-card{display:flex;gap:10px;padding:13px;margin-top:13px;border-radius:12px;background:#fff;color:#0051d5}.tip-card p{margin:0;color:#64748b;font-size:9px;line-height:1.6}.tip-card b{display:block;margin-bottom:3px;color:#334155}.config-panel{position:sticky;top:88px}.config-panel>header{display:flex;align-items:center;justify-content:space-between;padding:16px 18px;border-bottom:1px solid #eff4ff}.config-panel>header>div{display:flex;align-items:center;gap:8px}.config-panel h2{margin:0;font-size:14px}.config-form{padding:17px}.upload-blocker{margin-bottom:14px}.config-form :deep(.el-form-item){margin-bottom:14px}.config-form :deep(.el-form-item__label){font-size:9px;font-weight:700}.config-form small{display:block;margin-top:5px;color:#94a3b8;font-size:8px}.category-radios{display:grid;grid-template-columns:1fr 1fr;width:100%}.category-radios :deep(.el-radio-button__inner){width:100%;height:48px;display:flex;align-items:flex-start;flex-direction:column;font-size:9px}.category-radios :deep(small){font-weight:400}.form-two{display:grid;grid-template-columns:1fr 1fr;gap:9px}.advanced-title{display:flex;align-items:center;gap:7px;padding-top:2px;margin-bottom:11px;color:#334155;font-size:10px}.switch-setting{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px;margin-bottom:9px;border-radius:9px;background:#f8fafc}.switch-setting b,.switch-setting small{display:block}.switch-setting b{font-size:9px}.slider-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:10px}.slider-grid label{font-size:8px}.slider-grid b{float:right;color:#0051d5}.submit-bar{position:fixed;z-index:29;right:32px;bottom:14px;left:288px;display:flex;align-items:center;gap:8px;padding:11px 14px}.submit-bar>div{flex:1;display:flex;align-items:center;gap:10px}.submit-bar>div>span:last-child{color:#64748b;font-size:8px}
-.task-center{padding:18px;overflow:hidden}.task-center>header{display:flex;align-items:center;justify-content:space-between;margin-bottom:15px}.task-center h2{margin:0;font-size:16px}.task-center header p{margin:4px 0 0;color:#64748b;font-size:10px}.task-center small{display:block;margin-top:5px;color:#64748b;font-size:8px}
+.upload-page{padding-bottom:90px}.upload-head{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:18px}.upload-head>div:first-child>p{display:flex;align-items:center;gap:6px;margin:0 0 7px;color:#94a3b8;font-size:10px}.upload-head>div:first-child>div{display:flex;align-items:baseline;gap:10px}.upload-head h1{margin:0;font-size:26px}.upload-head>div:first-child span{color:#0051d5;font-size:8px;letter-spacing:.08em}.upload-head>div:last-child{display:flex;gap:8px}.upload-grid{display:grid;grid-template-columns:minmax(0,1fr) 420px;gap:17px;align-items:start}.upload-left{min-width:0}.dropzone :deep(.el-upload-dragger){min-height:275px;display:flex;flex-direction:column;align-items:center;justify-content:center;border:2px dashed #bfdbfe;border-radius:16px;background:linear-gradient(140deg,#fff,#f6f9ff)}.upload-icon{font-size:36px;color:#0051d5}.dropzone h3{margin:13px 0 5px;font-size:14px}.dropzone p{margin:0 0 13px;color:#64748b;font-size:9px}.dropzone>span{margin-top:8px;color:#94a3b8;font-size:8px}.file-types{display:flex;gap:7px;margin-top:13px}.file-types i{padding:4px 7px;border-radius:5px;background:#f1f5f9;color:#64748b;font-size:8px;font-style:normal;font-weight:700}.queue{margin-top:14px}.file-row{display:flex;gap:12px;padding:12px 0;border-top:1px solid #eff4ff}.file-icon{width:38px;height:38px;flex:none;display:grid;place-items:center;border-radius:10px}.file-icon.pdf{background:#fef2f2;color:#dc2626}.file-icon.docx{background:#eff4ff;color:#0051d5}.file-copy{min-width:0;flex:1}.file-copy header{display:flex;align-items:center}.file-copy header b{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:10px}.file-meta{display:flex;align-items:center;gap:7px;margin:3px 0 7px;color:#64748b;font-size:8px}.file-copy footer{display:flex;justify-content:space-between;margin-top:5px;color:#059669;font-size:8px}.file-copy footer small{color:#94a3b8}.compliance{display:flex;align-items:center;gap:7px;padding:9px;margin-top:8px;border-radius:8px;background:#ecfdf5;color:#059669;font-size:8px}.compliance b{margin-left:auto;color:#64748b}.tip-card{display:flex;gap:10px;padding:13px;margin-top:13px;border-radius:12px;background:#fff;color:#0051d5}.tip-card p{margin:0;color:#64748b;font-size:9px;line-height:1.6}.tip-card b{display:block;margin-bottom:3px;color:#334155}.config-panel{position:sticky;top:88px}.config-panel>header{display:flex;align-items:center;justify-content:space-between;padding:16px 18px;border-bottom:1px solid #eff4ff}.config-panel>header>div{display:flex;align-items:center;gap:8px}.config-panel h2{margin:0;font-size:14px}.config-form{padding:17px}.upload-blocker{margin-bottom:14px}.config-form :deep(.el-form-item){margin-bottom:14px}.config-form :deep(.el-form-item__label){font-size:9px;font-weight:700}.config-form small{display:block;margin-top:5px;color:#94a3b8;font-size:8px}.category-radios{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:100%;overflow:hidden;border:1px solid var(--el-border-color);border-radius:8px}.category-radios :deep(.el-radio-button){display:block;min-width:0}.category-radios :deep(.el-radio-button__inner){width:100%;height:48px;display:flex;align-items:flex-start;flex-direction:column;border:0;border-radius:0!important;box-shadow:none!important;font-size:9px}.category-radios :deep(.el-radio-button:nth-child(-n+2) .el-radio-button__inner){border-bottom:1px solid var(--el-border-color)}.category-radios :deep(.el-radio-button:nth-child(odd) .el-radio-button__inner){border-right:1px solid var(--el-border-color)}.category-radios :deep(.el-radio-button.is-active .el-radio-button__inner){position:relative;z-index:1}.category-radios :deep(small){font-weight:400}.advanced-title{display:flex;align-items:center;gap:7px;padding-top:2px;margin-bottom:11px;color:#334155;font-size:10px}.switch-setting{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px;margin-bottom:9px;border-radius:9px;background:#f8fafc}.switch-setting b,.switch-setting small{display:block}.switch-setting b{font-size:9px}.slider-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:10px}.slider-grid label{font-size:8px}.slider-grid b{float:right;color:#0051d5}.submit-bar{position:fixed;z-index:29;right:32px;bottom:14px;left:288px;display:flex;align-items:center;gap:8px;padding:11px 14px}.submit-bar>div{flex:1;display:flex;align-items:center;gap:10px}.submit-bar>div>span:last-child{color:#64748b;font-size:8px}
+.task-center{padding:18px;overflow:hidden}.task-center>header{display:flex;align-items:center;justify-content:space-between;margin-bottom:15px}.task-center h2{margin:0;font-size:16px}.task-center header p{margin:4px 0 0;color:#64748b;font-size:10px}.task-center small{display:block;margin-top:5px;color:#64748b;font-size:8px}.task-file-name{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#334155;font-weight:650}.file-extension{display:inline-flex;padding:4px 7px;border-radius:6px;background:#eff4ff;color:#0051d5;font-size:9px;font-weight:800}.task-error-detail{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 8px;margin-top:7px}.task-error-detail b{color:#b91c1c;font-size:10px}.task-error-detail code{align-self:start;padding:2px 5px;border-radius:4px;background:#fef2f2;color:#dc2626;font-size:8px}.task-error-detail p{grid-column:1/-1;margin:0;color:#7f1d1d;font-size:9px;line-height:1.55}
 @media(max-width:1200px){.upload-grid{grid-template-columns:1fr}.config-panel{position:static}.submit-bar{left:274px}}
-@media(max-width:1100px){.submit-bar{left:18px;right:18px}.upload-head{align-items:flex-start;flex-direction:column;gap:10px}.task-center{overflow-x:auto}.task-center :deep(.el-table){min-width:820px}}
-@media(max-width:720px){.upload-page{padding-bottom:135px}.form-two,.slider-grid{grid-template-columns:1fr}.submit-bar{align-items:stretch;flex-wrap:wrap}.submit-bar>div{flex-basis:100%;flex-direction:column;align-items:flex-start}.submit-bar>.el-button:not(.primary-btn){display:none}.submit-bar>.primary-btn{width:100%;margin:0}.upload-head>div:last-child{display:none}.compliance b{display:none}}
+@media(max-width:1100px){.submit-bar{left:18px;right:18px}.upload-head{align-items:flex-start;flex-direction:column;gap:10px}.task-center{overflow-x:auto}.task-center :deep(.el-table){min-width:1250px}}
+@media(max-width:720px){.upload-page{padding-bottom:135px}.slider-grid{grid-template-columns:1fr}.submit-bar{align-items:stretch;flex-wrap:wrap}.submit-bar>div{flex-basis:100%;flex-direction:column;align-items:flex-start}.submit-bar>.el-button:not(.primary-btn){display:none}.submit-bar>.primary-btn{width:100%;margin:0}.upload-head>div:last-child{display:none}.compliance b{display:none}}
 </style>

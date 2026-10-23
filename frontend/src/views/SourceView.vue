@@ -48,7 +48,7 @@ const loadSource = async () => {
 const download = async () => {
   if (!documentData.value) return
   try {
-    const response = await authenticatedRawRequest(`/documents/${documentData.value.id}/download`)
+    const response = await authenticatedRawRequest(citation.value?.downloadUrl || `/documents/${documentData.value.id}/download`)
     const blobUrl = URL.createObjectURL(await response.blob())
     const link = document.createElement('a')
     link.href = blobUrl
