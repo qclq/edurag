@@ -18,6 +18,7 @@ TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "partial_success"}
 TASK_TYPE_LABELS = {
     "document_ingestion": "文档入库",
     "document_reprocess": "文档重新处理",
+    "chunk_reembedding": "切片重向量",
     "knowledge_base_rebuild": "知识库索引重建",
     "user_import": "用户批量导入",
 }
@@ -29,7 +30,9 @@ def task_failure_details(task: ProcessingTask) -> dict[str, Any] | None:
     code = task.error_code or "TASK_FAILED"
     raw = f"{code} {task.error_message or ''}".lower()
     retryable = True
-    if "ocr_not_configured" in raw:
+    if "task_dispatch_failed" in raw or "celery" in raw or "redis" in raw:
+        action = "请检查 Redis 与 Celery worker 的运行状态；服务恢复后点击重试。"
+    elif "ocr_not_configured" in raw:
         action = "请先配置 QWEN_API_KEY，再点击重试；不需要识别图片时，也可以关闭 OCR 后重新上传。"
     elif "ocr_provider_not_found" in raw or ("ocr" in raw and "404" in raw):
         action = "请检查 QWEN_OCR_MODEL 与 QWEN_OCR_BASE_URL；当前通用端点建议使用 qwen-vl-ocr，修正后点击重试。"
@@ -229,6 +232,19 @@ def update_task(
             "errorCode": error_code,
             "errorMessage": error_message,
         },
+    )
+
+
+def mark_task_dispatch_failed(db: Session, task: ProcessingTask) -> None:
+    update_task(
+        db,
+        task,
+        status="failed",
+        stage="dispatch",
+        progress_percent=0,
+        progress_text="后台处理任务提交失败",
+        error_code="TASK_DISPATCH_FAILED",
+        error_message="后台任务队列不可用，请检查 Redis 和 Celery worker 后重试",
     )
 
 

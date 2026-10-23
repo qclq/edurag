@@ -32,7 +32,7 @@ from app.modules.knowledge_bases.service import (
 from app.modules.operations.service import record_audit
 from app.modules.operations.retention import purge_knowledge_base_operations
 from app.modules.rag.service import retrieve
-from app.modules.tasks.service import create_task, task_payload
+from app.modules.tasks.service import create_task, mark_task_dispatch_failed, task_payload
 from app.modules.users.models import User
 from app.workers.maintenance import dispatch_knowledge_base_rebuild
 
@@ -215,8 +215,9 @@ def rebuild_index(
     if settings.environment != "test":
         try:
             dispatch_knowledge_base_rebuild(str(task.id), settings)
-        except RuntimeError:
-            pass
+        except Exception:
+            mark_task_dispatch_failed(db, task)
+            db.commit()
     return success(request, task_payload(task, include_events=False), status_code=202)
 
 

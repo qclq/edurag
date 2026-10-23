@@ -18,6 +18,44 @@ def _office_converter_available(binary: str) -> bool:
     return bool(shutil.which(binary) or Path(binary).is_file())
 
 
+def _pipeline_runtime_status(settings: Settings) -> dict[str, object]:
+    if settings.task_dispatch_mode == "inline":
+        return {
+            "status": "ready",
+            "dispatchMode": "inline",
+            "broker": "not_required",
+            "worker": "inline",
+            "workerCount": 1,
+        }
+    try:
+        from app.workers.celery_app import celery_app
+
+        with celery_app.connection_for_read() as connection:
+            connection.ensure_connection(max_retries=0)
+    except Exception:
+        return {
+            "status": "degraded",
+            "dispatchMode": "celery",
+            "broker": "unavailable",
+            "worker": "unknown",
+            "workerCount": 0,
+        }
+    try:
+        replies = celery_app.control.inspect(
+            timeout=settings.task_queue_health_timeout_seconds
+        ).ping()
+    except Exception:
+        replies = None
+    worker_count = len(replies or {})
+    return {
+        "status": "ready" if worker_count else "degraded",
+        "dispatchMode": "celery",
+        "broker": "available",
+        "worker": "available" if worker_count else "unavailable",
+        "workerCount": worker_count,
+    }
+
+
 @router.get("/bootstrap", summary="读取公开系统启动配置")
 def bootstrap(request: Request, settings: Settings = Depends(get_settings)):
     sso_enabled = settings.sso_provider != "disabled"
@@ -99,3 +137,16 @@ def ready(request: Request, db: Session = Depends(get_db)):
     except Exception as exc:
         raise AppError(503, "SYSTEM_NOT_READY", "数据库连接不可用") from exc
     return success(request, {"status": "ready", "database": "available"})
+
+
+@router.get("/health/pipeline", include_in_schema=False)
+def pipeline_ready(request: Request, settings: Settings = Depends(get_settings)):
+    status = _pipeline_runtime_status(settings)
+    if status["status"] != "ready":
+        raise AppError(
+            503,
+            "PIPELINE_NOT_READY",
+            "文档处理后台服务不可用，请检查 Redis 和 Celery worker",
+            details=status,
+        )
+    return success(request, status)

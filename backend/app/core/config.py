@@ -87,6 +87,7 @@ class Settings(BaseSettings):
 
     task_dispatch_mode: Literal["celery", "inline"] = "celery"
     task_event_poll_seconds: float = 1.0
+    task_queue_health_timeout_seconds: float = Field(default=1.5, gt=0, le=10)
     admin_record_retention_hours: int = 72
     admin_record_cleanup_batch_size: int = 1000
 

@@ -14,11 +14,19 @@ celery_app.conf.update(
     task_acks_late=True,
     worker_prefetch_multiplier=1,
     task_reject_on_worker_lost=True,
+    broker_connection_timeout=3.0,
+    broker_connection_retry_on_startup=True,
+    task_publish_retry=True,
+    task_publish_retry_policy={"max_retries": 3, "interval_start": 0, "interval_step": 0.5, "interval_max": 1},
     imports=("app.workers.document_pipeline", "app.workers.answer_generation", "app.workers.maintenance"),
     beat_schedule={
         "admin-record-retention-hourly": {
             "task": "edurag.retain_admin_records",
             "schedule": 3600.0,
+        },
+        "queued-chunk-reembedding-recovery": {
+            "task": "edurag.recover_queued_chunk_reembedding",
+            "schedule": 30.0,
         },
     },
 )

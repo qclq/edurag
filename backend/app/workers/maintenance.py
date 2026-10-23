@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import uuid
 
 from sqlalchemy import select
@@ -54,7 +55,8 @@ def run_knowledge_base_rebuild(task_id: str, settings: Settings | None = None) -
                 progress_text="知识库重建子任务",
             )
             db.commit()
-            run_document_pipeline(str(child.id), settings)
+            while not run_document_pipeline(str(child.id), settings):
+                time.sleep(5)
             db.expire_all()
             child = db.get(ProcessingTask, child.id)
             if not child or child.status != "succeeded":

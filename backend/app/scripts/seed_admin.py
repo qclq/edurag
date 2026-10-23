@@ -34,6 +34,7 @@ PERMISSION_CODES = (
     "task.read",
     "task.retry",
     "task.cancel",
+    "task.delete",
     "feedback.read",
     "feedback.manage",
     "user.read",

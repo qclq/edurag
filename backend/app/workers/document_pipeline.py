@@ -8,15 +8,17 @@ import posixpath
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from xml.etree import ElementTree
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.config import Settings, get_settings
@@ -27,7 +29,7 @@ from app.integrations.ocr import ocr_image
 from app.integrations.storage import get_storage
 from app.modules.documents.models import Document, DocumentAclEntry, DocumentChunk, DocumentVersion
 from app.modules.knowledge_bases.models import KnowledgeBase
-from app.modules.tasks.models import ProcessingTask, VectorIndexOutbox
+from app.modules.tasks.models import ProcessingTask, TaskItem, VectorIndexOutbox
 from app.modules.tasks.service import get_task_or_404, update_task
 
 
@@ -54,6 +56,65 @@ LIBREOFFICE_FILTERS = {
     "xlsx": "xlsx:Calc MS Excel 2007 XML",
     "pptx": "pptx:Impress MS PowerPoint 2007 XML",
 }
+
+_local_version_locks: dict[uuid.UUID, threading.Lock] = {}
+_local_version_locks_guard = threading.Lock()
+
+
+def _try_acquire_version_lock(db: Session, version_id: uuid.UUID) -> Callable[[], None] | None:
+    """Hold one pipeline per document version across commits and worker processes."""
+    bind = db.get_bind()
+    if bind.dialect.name == "postgresql":
+        lock_key = int.from_bytes(version_id.bytes[:8], byteorder="big", signed=True)
+        connection = bind.connect()
+        try:
+            acquired = bool(
+                connection.execute(
+                    text("SELECT pg_try_advisory_lock(:lock_key)"),
+                    {"lock_key": lock_key},
+                ).scalar()
+            )
+            # Session-level advisory locks survive commits; ending this short
+            # transaction avoids an idle-in-transaction connection while OCR
+            # or embedding calls are in flight.
+            connection.commit()
+        except Exception:
+            connection.close()
+            raise
+        if not acquired:
+            connection.close()
+            return None
+
+        def release_postgres_lock() -> None:
+            try:
+                connection.execute(
+                    text("SELECT pg_advisory_unlock(:lock_key)"),
+                    {"lock_key": lock_key},
+                )
+                connection.commit()
+            except Exception:
+                # A dropped PostgreSQL session releases advisory locks itself.
+                # Do not turn an already committed pipeline into a false failure.
+                pass
+            finally:
+                connection.close()
+
+        return release_postgres_lock
+
+    # SQLite is used by tests and local-only deployments. A process-local lock
+    # gives it the same behavior without relying on unsupported advisory SQL.
+    with _local_version_locks_guard:
+        local_lock = _local_version_locks.setdefault(version_id, threading.Lock())
+    if not local_lock.acquire(blocking=False):
+        return None
+
+    def release_local_lock() -> None:
+        local_lock.release()
+        with _local_version_locks_guard:
+            if not local_lock.locked() and _local_version_locks.get(version_id) is local_lock:
+                _local_version_locks.pop(version_id, None)
+
+    return release_local_lock
 
 
 class DocumentConversionError(RuntimeError):
@@ -513,18 +574,31 @@ def _load_objects(db: Session, task_id) -> tuple[ProcessingTask, DocumentVersion
     return task, version, document, kb
 
 
-def run_document_pipeline(task_id: str, settings: Settings | None = None) -> None:
+def run_document_pipeline(task_id: str, settings: Settings | None = None) -> bool:
     settings = settings or get_settings()
     with SessionLocal() as db:
         task = None
         version = None
         document = None
+        release_version_lock: Callable[[], None] | None = None
         try:
             task, version, document, kb = _load_objects(db, uuid.UUID(task_id))
+            release_version_lock = _try_acquire_version_lock(db, version.id)
+            if release_version_lock is None:
+                update_task(
+                    db,
+                    task,
+                    status="queued",
+                    stage="waiting_for_version",
+                    progress_percent=0,
+                    progress_text="同一文档版本正在处理中，任务将自动重试",
+                )
+                db.commit()
+                return False
             if task.cancel_requested_at:
                 update_task(db, task, status="cancelled", progress_text="任务已取消")
                 db.commit()
-                return
+                return True
             update_task(db, task, status="running", stage="parsing", progress_percent=10, progress_text="正在解析文档")
             version.process_status = "processing"
             version.process_stage = "parsing"
@@ -656,6 +730,7 @@ def run_document_pipeline(task_id: str, settings: Settings | None = None) -> Non
             document.enabled = True
             update_task(db, task, status="succeeded", stage="published", progress_percent=100, progress_text="文档已入库")
             db.commit()
+            return True
         except Exception as exc:
             db.rollback()
             if task is not None:
@@ -672,24 +747,295 @@ def run_document_pipeline(task_id: str, settings: Settings | None = None) -> Non
                     document.status = "failed"
                 update_task(db, task, status="failed", stage=task.stage, progress_text="文档处理失败", error_code=code, error_message=message)
                 db.commit()
+            return True
+        finally:
+            if release_version_lock is not None:
+                release_version_lock()
+
+
+def _chunk_reembedding_targets(
+    db: Session,
+    task: ProcessingTask,
+    version: DocumentVersion,
+) -> tuple[list[DocumentChunk], list[TaskItem]]:
+    items = db.scalars(
+        select(TaskItem).where(
+            TaskItem.task_id == task.id,
+            TaskItem.object_type == "document_chunk",
+        )
+    ).all()
+    if items:
+        chunk_ids = [item.object_id for item in items]
+        chunks = db.scalars(
+            select(DocumentChunk).where(
+                DocumentChunk.id.in_(chunk_ids),
+                DocumentChunk.document_version_id == version.id,
+            )
+        ).all()
+        return list(chunks), list(items)
+    # Compatibility for queued tasks created before chunk task items existed.
+    chunks = db.scalars(
+        select(DocumentChunk).where(
+            DocumentChunk.document_version_id == version.id,
+            DocumentChunk.vector_status == "pending",
+        )
+    ).all()
+    return list(chunks), []
+
+
+def run_chunk_reembedding(task_id: str, settings: Settings | None = None) -> bool:
+    settings = settings or get_settings()
+    with SessionLocal() as db:
+        task: ProcessingTask | None = None
+        release_version_lock: Callable[[], None] | None = None
+        target_snapshots: dict[uuid.UUID, tuple[int, str]] = {}
+        try:
+            task, version, document, kb = _load_objects(db, uuid.UUID(task_id))
+            if task.type != "chunk_reembedding":
+                raise RuntimeError("任务类型不是切片重向量")
+            if task.status in {"succeeded", "failed", "cancelled", "partial_success"}:
+                return True
+            release_version_lock = _try_acquire_version_lock(db, version.id)
+            if release_version_lock is None:
+                update_task(
+                    db,
+                    task,
+                    status="queued",
+                    stage="waiting_for_version",
+                    progress_percent=0,
+                    progress_text="同一文档版本正在处理中，任务将自动重试",
+                )
+                db.commit()
+                return False
+
+            chunks, items = _chunk_reembedding_targets(db, task, version)
+            if task.cancel_requested_at:
+                for item in items:
+                    item.status = "cancelled"
+                update_task(db, task, status="cancelled", progress_text="任务已取消")
+                db.commit()
+                return True
+            if not chunks:
+                for item in items:
+                    item.status = "succeeded"
+                update_task(
+                    db,
+                    task,
+                    status="succeeded",
+                    stage="published",
+                    progress_percent=100,
+                    progress_text="切片无需重新生成向量",
+                )
+                db.commit()
+                return True
+
+            for item in items:
+                item.status = "running"
+            target_snapshots = {
+                chunk.id: (chunk.row_version, chunk.content_hash)
+                for chunk in chunks
+            }
+            update_task(
+                db,
+                task,
+                status="running",
+                stage="embedding",
+                progress_percent=30,
+                progress_text="正在重新生成切片向量",
+            )
+            db.commit()
+            vectors = embed_texts([chunk.content for chunk in chunks], settings)
+
+            db.expire_all()
+            current_chunks = {
+                chunk.id: chunk
+                for chunk in db.scalars(
+                    select(DocumentChunk).where(DocumentChunk.id.in_(target_snapshots))
+                ).all()
+            }
+            stable_pairs = [
+                (current_chunks[chunk.id], vector)
+                for chunk, vector in zip(chunks, vectors, strict=True)
+                if chunk.id in current_chunks
+                and target_snapshots[chunk.id]
+                == (current_chunks[chunk.id].row_version, current_chunks[chunk.id].content_hash)
+            ]
+            if not stable_pairs:
+                for item in items:
+                    item.status = "succeeded"
+                update_task(
+                    db,
+                    task,
+                    status="succeeded",
+                    stage="superseded",
+                    progress_percent=100,
+                    progress_text="切片已有更新，将由最新任务生成向量",
+                )
+                db.commit()
+                return True
+
+            collection = f"{settings.milvus_collection_prefix}_{re.sub(r'[^a-zA-Z0-9_]', '_', settings.embedding_model)}"
+            tokens = _search_acl_tokens(db, kb, document)
+            expires_at = int(datetime.combine(document.expires_at, datetime.min.time(), tzinfo=UTC).timestamp()) if document.expires_at else 0
+            vector_rows = []
+            outbox_events = []
+            for chunk, vector in stable_pairs:
+                chunk.vector_id = str(chunk.id)
+                chunk.embedding_model = settings.embedding_model
+                chunk.embedding_dimension = settings.embedding_dimension
+                chunk.token_count = max(1, len(chunk.content) // 2)
+                outbox = db.scalar(
+                    select(VectorIndexOutbox).where(
+                        VectorIndexOutbox.operation == "upsert",
+                        VectorIndexOutbox.chunk_id == chunk.id,
+                        VectorIndexOutbox.collection_name == collection,
+                    )
+                )
+                if outbox is None:
+                    outbox = VectorIndexOutbox(
+                        operation="upsert",
+                        chunk_id=chunk.id,
+                        document_version_id=version.id,
+                        collection_name=collection,
+                    )
+                    db.add(outbox)
+                outbox.payload = {"contentHash": chunk.content_hash}
+                outbox.status = "pending"
+                outbox.retry_count = 0
+                outbox.next_retry_at = None
+                outbox.last_error = None
+                outbox_events.append(outbox)
+                vector_rows.append(
+                    {
+                        "chunk_id": str(chunk.id),
+                        "embedding": vector,
+                        "knowledge_base_id": str(kb.id),
+                        "document_id": str(document.id),
+                        "document_version_id": str(version.id),
+                        "is_active": True,
+                        "expires_at": expires_at,
+                        "search_acl_tokens": tokens,
+                        "embedding_model": settings.embedding_model,
+                    }
+                )
+            update_task(
+                db,
+                task,
+                status="running",
+                stage="indexing",
+                progress_percent=75,
+                progress_text="正在更新切片向量索引",
+            )
+            db.commit()
+
+            if settings.milvus_enabled:
+                from app.integrations.milvus import MilvusIndex
+
+                MilvusIndex(settings).upsert(collection, vector_rows)
+            for chunk, _ in stable_pairs:
+                chunk.vector_status = "ready"
+            for outbox in outbox_events:
+                outbox.status = "processed"
+            for item in items:
+                item.status = "succeeded"
+            update_task(
+                db,
+                task,
+                status="succeeded",
+                stage="published",
+                progress_percent=100,
+                progress_text="切片向量已更新",
+            )
+            db.commit()
+            return True
+        except Exception as exc:
+            db.rollback()
+            if task is not None:
+                task = db.get(ProcessingTask, task.id)
+                code = getattr(exc, "code", "CHUNK_REEMBEDDING_FAILED")
+                message = str(exc)[:1000] or "切片重向量失败"
+                if task:
+                    items = db.scalars(select(TaskItem).where(TaskItem.task_id == task.id)).all()
+                    for item in items:
+                        item.status = "failed"
+                        item.error_code = code
+                        item.error_message = message
+                    for chunk in db.scalars(
+                        select(DocumentChunk).where(DocumentChunk.id.in_(target_snapshots))
+                    ).all():
+                        if target_snapshots.get(chunk.id) == (chunk.row_version, chunk.content_hash):
+                            chunk.vector_status = "failed"
+                    update_task(
+                        db,
+                        task,
+                        status="failed",
+                        stage=task.stage,
+                        progress_text="切片重向量失败",
+                        error_code=code,
+                        error_message=message,
+                    )
+                    db.commit()
+            return True
+        finally:
+            if release_version_lock is not None:
+                release_version_lock()
 
 
 def dispatch_document_pipeline(task_id: str, settings: Settings) -> None:
     if settings.task_dispatch_mode == "inline":
-        run_document_pipeline(task_id, settings)
+        while not run_document_pipeline(task_id, settings):
+            time.sleep(0.1)
         return
     process_document.delay(task_id)
+
+
+def dispatch_chunk_reembedding(task_id: str, settings: Settings) -> None:
+    if settings.task_dispatch_mode == "inline":
+        while not run_chunk_reembedding(task_id, settings):
+            time.sleep(0.1)
+        return
+    process_chunk_reembedding.delay(task_id)
+
+
+def recover_queued_chunk_reembedding(settings: Settings | None = None, *, limit: int = 50) -> int:
+    settings = settings or get_settings()
+    with SessionLocal() as db:
+        task_ids = db.scalars(
+            select(ProcessingTask.id)
+            .where(
+                ProcessingTask.type == "chunk_reembedding",
+                ProcessingTask.status == "queued",
+            )
+            .order_by(ProcessingTask.created_at)
+            .limit(limit)
+        ).all()
+    completed = 0
+    for task_id in task_ids:
+        if run_chunk_reembedding(str(task_id), settings):
+            completed += 1
+    return completed
 
 
 try:
     from app.workers.celery_app import celery_app
 
-    @celery_app.task(name="edurag.process_document", autoretry_for=(), max_retries=0)
-    def process_document(task_id: str) -> None:
-        run_document_pipeline(task_id)
+    @celery_app.task(bind=True, name="edurag.process_document", autoretry_for=(), max_retries=None)
+    def process_document(self, task_id: str) -> None:
+        if not run_document_pipeline(task_id):
+            raise self.retry(countdown=5)
+
+    @celery_app.task(bind=True, name="edurag.process_chunk_reembedding", autoretry_for=(), max_retries=None)
+    def process_chunk_reembedding(self, task_id: str) -> None:
+        if not run_chunk_reembedding(task_id):
+            raise self.retry(countdown=5)
+
+    @celery_app.task(name="edurag.recover_queued_chunk_reembedding", autoretry_for=(), max_retries=0)
+    def recover_queued_chunk_reembedding_task() -> int:
+        return recover_queued_chunk_reembedding()
 except ImportError:
     class _UnavailableTask:
         def delay(self, task_id: str) -> None:
             raise RuntimeError("Celery 未安装，无法派发后台任务")
 
     process_document = _UnavailableTask()
+    process_chunk_reembedding = _UnavailableTask()

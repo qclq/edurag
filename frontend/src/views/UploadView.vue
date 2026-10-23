@@ -1,8 +1,8 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
-import { ArrowLeft, Check, Close, Document, Files, InfoFilled, Refresh, Setting, UploadFilled } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { ArrowLeft, Check, Close, Delete, Document, Files, InfoFilled, Refresh, Setting, UploadFilled } from '@element-plus/icons-vue'
 import StatusPill from '../components/StatusPill.vue'
 import QuickKnowledgeBaseDialog from '../components/QuickKnowledgeBaseDialog.vue'
 import { authenticatedRequest, useAuth } from '../stores/auth'
@@ -18,6 +18,7 @@ const mode = ref('上传文档')
 const submitting = ref(false)
 const pageLoading = ref(false)
 const loadError = ref('')
+const pipelineError = ref('')
 const uploadRef = ref(null)
 const createKbOpen = ref(false)
 const config = ref({ kb:'', category:'规章制度', number:'', ocr:false, vectorize:true, chunk:512, overlap:64 })
@@ -61,6 +62,7 @@ const loadPage = async () => {
     authenticatedRequest('/admin/document-upload-config'),
     authenticatedRequest('/admin/knowledge-bases?pageSize=100', { includeEnvelope: true }),
     authenticatedRequest('/admin/tasks?pageSize=20', { includeEnvelope: true }),
+    authenticatedRequest('/system/health/pipeline'),
   ])
   if (results[0].status === 'fulfilled') serverUploadConfig.value = results[0].value
   if (results[1].status === 'fulfilled') {
@@ -70,6 +72,7 @@ const loadPage = async () => {
     loadError.value = results[1].reason?.message || '可管理知识库加载失败'
   }
   if (results[2].status === 'fulfilled') tasks.value = results[2].value.data || []
+  pipelineError.value = results[3].status === 'rejected' ? (results[3].reason?.message || '文档处理后台服务不可用') : ''
   pageLoading.value = false
 }
 
@@ -143,6 +146,15 @@ const loadTasks = async ({ silent = false } = {}) => {
     tasks.value = envelope.data || []
   } catch (error) { if (!silent) ElMessage.error(error.message || '任务列表加载失败') }
 }
+const loadPipelineHealth = async () => {
+  try {
+    await authenticatedRequest('/system/health/pipeline')
+    pipelineError.value = ''
+  } catch (error) {
+    pipelineError.value = error.message || '文档处理后台服务不可用'
+  }
+}
+const refreshTaskCenter = async () => Promise.all([loadTasks(), loadPipelineHealth()])
 
 const retryTask = async (task) => {
   try { await authenticatedRequest(`/admin/tasks/${task.id}/retry`, { method: 'POST', body: { fromStage: task.stage || null } }); ElMessage.success('重试任务已提交'); await loadTasks() }
@@ -151,6 +163,20 @@ const retryTask = async (task) => {
 const cancelTask = async (task) => {
   try { await authenticatedRequest(`/admin/tasks/${task.id}/cancel`, { method: 'POST' }); ElMessage.success('已请求取消任务'); await loadTasks() }
   catch (error) { ElMessage.error(error.message || '任务取消失败') }
+}
+const deleteTask = async (task) => {
+  try {
+    await ElMessageBox.confirm(
+      `确认删除任务记录 ${task.taskNo}？此操作不会删除已经入库的文档。`,
+      '删除任务记录',
+      { type: 'warning', confirmButtonText: '删除记录', cancelButtonText: '取消' },
+    )
+    await authenticatedRequest(`/admin/tasks/${task.id}`, { method: 'DELETE' })
+    ElMessage.success('任务记录已删除')
+    await loadTasks({ silent: true })
+  } catch (error) {
+    if (!['cancel', 'close'].includes(error)) ElMessage.error(error.message || '任务记录删除失败')
+  }
 }
 
 const rejectUploadFile = (file) => uploadRef.value?.handleRemove(file)
@@ -222,9 +248,14 @@ const handleKnowledgeBaseCreated = (created) => {
 }
 
 let taskPollTimer = null
+let pipelinePollTimer = null
 const updateTaskPolling = (value) => {
   window.clearInterval(taskPollTimer)
-  if (value === '任务中心') taskPollTimer = window.setInterval(() => loadTasks({ silent: true }), 3000)
+  window.clearInterval(pipelinePollTimer)
+  if (value === '任务中心') {
+    taskPollTimer = window.setInterval(() => loadTasks({ silent: true }), 3000)
+    pipelinePollTimer = window.setInterval(loadPipelineHealth, 15000)
+  }
 }
 watch(mode, updateTaskPolling)
 
@@ -233,7 +264,10 @@ onMounted(async () => {
   await loadPage()
   updateTaskPolling(mode.value)
 })
-onBeforeUnmount(() => window.clearInterval(taskPollTimer))
+onBeforeUnmount(() => {
+  window.clearInterval(taskPollTimer)
+  window.clearInterval(pipelinePollTimer)
+})
 </script>
 
 <template>
@@ -272,7 +306,8 @@ onBeforeUnmount(() => window.clearInterval(taskPollTimer))
     </div>
 
     <section v-else class="panel task-center">
-      <header><div><h2>处理任务</h2><p>每 3 秒自动更新文档解析、切片和向量入库进度；失败任务会显示具体原因和处理建议</p></div><el-button :icon="Refresh" @click="loadTasks()">刷新</el-button></header>
+      <header><div><h2>处理任务</h2><p>每 3 秒自动更新文档解析、切片和向量入库进度；失败任务会显示具体原因和处理建议</p></div><el-button :icon="Refresh" @click="refreshTaskCenter">刷新</el-button></header>
+      <el-alert v-if="pipelineError" class="pipeline-alert" type="error" show-icon :closable="false" title="文档处理后台服务未就绪"><template #default>{{pipelineError}}。请检查云服务器上的 Redis 与 Celery worker 状态。</template></el-alert>
       <el-table :data="tasks" row-key="id">
         <el-table-column prop="taskNo" label="任务编号" min-width="190" />
         <el-table-column label="原文件名" min-width="240"><template #default="{row}"><span class="task-file-name" :title="row.fileName || '非文档任务'">{{ row.fileName || '—' }}</span></template></el-table-column>
@@ -287,7 +322,7 @@ onBeforeUnmount(() => window.clearInterval(taskPollTimer))
           <small v-else>{{ row.progressText || '等待任务更新' }}</small>
         </template></el-table-column>
         <el-table-column label="创建时间" min-width="170"><template #default="{row}">{{new Date(row.createdAt).toLocaleString('zh-CN')}}</template></el-table-column>
-        <el-table-column label="操作" width="130"><template #default="{row}"><el-button v-if="['failed','cancelled'].includes(row.status)" text type="primary" @click="retryTask(row)">重试</el-button><el-button v-if="!['succeeded','failed','cancelled','partial_success'].includes(row.status)" text type="danger" @click="cancelTask(row)">取消</el-button></template></el-table-column>
+        <el-table-column label="操作" width="180"><template #default="{row}"><el-button v-if="['failed','cancelled'].includes(row.status)" text type="primary" @click="retryTask(row)">重试</el-button><el-button v-if="!['succeeded','failed','cancelled','partial_success'].includes(row.status)" text type="danger" @click="cancelTask(row)">取消</el-button><el-button v-if="['succeeded','failed','cancelled','partial_success'].includes(row.status)" text type="danger" :icon="Delete" @click="deleteTask(row)">删除</el-button></template></el-table-column>
       </el-table>
       <el-empty v-if="!tasks.length" description="暂无处理任务" />
     </section>
@@ -300,6 +335,7 @@ onBeforeUnmount(() => window.clearInterval(taskPollTimer))
 <style scoped>
 .upload-page{padding-bottom:90px}.upload-head{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:18px}.upload-head>div:first-child>p{display:flex;align-items:center;gap:6px;margin:0 0 7px;color:#94a3b8;font-size:10px}.upload-head>div:first-child>div{display:flex;align-items:baseline;gap:10px}.upload-head h1{margin:0;font-size:26px}.upload-head>div:first-child span{color:#0051d5;font-size:8px;letter-spacing:.08em}.upload-head>div:last-child{display:flex;gap:8px}.upload-grid{display:grid;grid-template-columns:minmax(0,1fr) 420px;gap:17px;align-items:start}.upload-left{min-width:0}.dropzone :deep(.el-upload-dragger){min-height:275px;display:flex;flex-direction:column;align-items:center;justify-content:center;border:2px dashed #bfdbfe;border-radius:16px;background:linear-gradient(140deg,#fff,#f6f9ff)}.upload-icon{font-size:36px;color:#0051d5}.dropzone h3{margin:13px 0 5px;font-size:14px}.dropzone p{margin:0 0 13px;color:#64748b;font-size:9px}.dropzone>span{margin-top:8px;color:#94a3b8;font-size:8px}.file-types{display:flex;gap:7px;margin-top:13px}.file-types i{padding:4px 7px;border-radius:5px;background:#f1f5f9;color:#64748b;font-size:8px;font-style:normal;font-weight:700}.queue{margin-top:14px}.file-row{display:flex;gap:12px;padding:12px 0;border-top:1px solid #eff4ff}.file-icon{width:38px;height:38px;flex:none;display:grid;place-items:center;border-radius:10px}.file-icon.pdf{background:#fef2f2;color:#dc2626}.file-icon.docx{background:#eff4ff;color:#0051d5}.file-copy{min-width:0;flex:1}.file-copy header{display:flex;align-items:center}.file-copy header b{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:10px}.file-meta{display:flex;align-items:center;gap:7px;margin:3px 0 7px;color:#64748b;font-size:8px}.file-copy footer{display:flex;justify-content:space-between;margin-top:5px;color:#059669;font-size:8px}.file-copy footer small{color:#94a3b8}.compliance{display:flex;align-items:center;gap:7px;padding:9px;margin-top:8px;border-radius:8px;background:#ecfdf5;color:#059669;font-size:8px}.compliance b{margin-left:auto;color:#64748b}.tip-card{display:flex;gap:10px;padding:13px;margin-top:13px;border-radius:12px;background:#fff;color:#0051d5}.tip-card p{margin:0;color:#64748b;font-size:9px;line-height:1.6}.tip-card b{display:block;margin-bottom:3px;color:#334155}.config-panel{position:sticky;top:88px}.config-panel>header{display:flex;align-items:center;justify-content:space-between;padding:16px 18px;border-bottom:1px solid #eff4ff}.config-panel>header>div{display:flex;align-items:center;gap:8px}.config-panel h2{margin:0;font-size:14px}.config-form{padding:17px}.upload-blocker{margin-bottom:14px}.config-form :deep(.el-form-item){margin-bottom:14px}.config-form :deep(.el-form-item__label){font-size:9px;font-weight:700}.config-form small{display:block;margin-top:5px;color:#94a3b8;font-size:8px}.category-radios{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:100%;overflow:hidden;border:1px solid var(--el-border-color);border-radius:8px}.category-radios :deep(.el-radio-button){display:block;min-width:0}.category-radios :deep(.el-radio-button__inner){width:100%;height:48px;display:flex;align-items:flex-start;flex-direction:column;border:0;border-radius:0!important;box-shadow:none!important;font-size:9px}.category-radios :deep(.el-radio-button:nth-child(-n+2) .el-radio-button__inner){border-bottom:1px solid var(--el-border-color)}.category-radios :deep(.el-radio-button:nth-child(odd) .el-radio-button__inner){border-right:1px solid var(--el-border-color)}.category-radios :deep(.el-radio-button.is-active .el-radio-button__inner){position:relative;z-index:1}.category-radios :deep(small){font-weight:400}.advanced-title{display:flex;align-items:center;gap:7px;padding-top:2px;margin-bottom:11px;color:#334155;font-size:10px}.switch-setting{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px;margin-bottom:9px;border-radius:9px;background:#f8fafc}.switch-setting b,.switch-setting small{display:block}.switch-setting b{font-size:9px}.slider-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:10px}.slider-grid label{font-size:8px}.slider-grid b{float:right;color:#0051d5}.submit-bar{position:fixed;z-index:29;right:32px;bottom:14px;left:288px;display:flex;align-items:center;gap:8px;padding:11px 14px}.submit-bar>div{flex:1;display:flex;align-items:center;gap:10px}.submit-bar>div>span:last-child{color:#64748b;font-size:8px}
 .task-center{padding:18px;overflow:hidden}.task-center>header{display:flex;align-items:center;justify-content:space-between;margin-bottom:15px}.task-center h2{margin:0;font-size:16px}.task-center header p{margin:4px 0 0;color:#64748b;font-size:10px}.task-center small{display:block;margin-top:5px;color:#64748b;font-size:8px}.task-file-name{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#334155;font-weight:650}.file-extension{display:inline-flex;padding:4px 7px;border-radius:6px;background:#eff4ff;color:#0051d5;font-size:9px;font-weight:800}.task-error-detail{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 8px;margin-top:7px}.task-error-detail b{color:#b91c1c;font-size:10px}.task-error-detail code{align-self:start;padding:2px 5px;border-radius:4px;background:#fef2f2;color:#dc2626;font-size:8px}.task-error-detail p{grid-column:1/-1;margin:0;color:#7f1d1d;font-size:9px;line-height:1.55}
+.pipeline-alert{margin-bottom:14px}
 @media(max-width:1200px){.upload-grid{grid-template-columns:1fr}.config-panel{position:static}.submit-bar{left:274px}}
 @media(max-width:1100px){.submit-bar{left:18px;right:18px}.upload-head{align-items:flex-start;flex-direction:column;gap:10px}.task-center{overflow-x:auto}.task-center :deep(.el-table){min-width:1250px}}
 @media(max-width:720px){.upload-page{padding-bottom:135px}.slider-grid{grid-template-columns:1fr}.submit-bar{align-items:stretch;flex-wrap:wrap}.submit-bar>div{flex-basis:100%;flex-direction:column;align-items:flex-start}.submit-bar>.el-button:not(.primary-btn){display:none}.submit-bar>.primary-btn{width:100%;margin:0}.upload-head>div:last-child{display:none}.compliance b{display:none}}

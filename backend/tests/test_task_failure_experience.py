@@ -68,6 +68,44 @@ def test_qwen_ocr_404_reports_model_or_endpoint_problem(monkeypatch: pytest.Monk
     assert "模型" in str(caught.value) or "接口" in str(caught.value)
 
 
+def test_terminal_task_record_can_be_deleted_without_touching_document_data(test_context) -> None:
+    client, testing_session, _ = test_context
+    with testing_session.begin() as db:
+        user = db.scalar(select(User).where(User.account == "2026000001"))
+        completed = ProcessingTask(
+            task_no="TASK-DELETE-COMPLETED",
+            type="document_ingestion",
+            status="succeeded",
+            created_by=user.id,
+            progress_percent=100,
+            progress_text="文档已入库",
+        )
+        active = ProcessingTask(
+            task_no="TASK-DELETE-ACTIVE",
+            type="document_ingestion",
+            status="running",
+            created_by=user.id,
+            progress_percent=50,
+            progress_text="正在生成向量",
+        )
+        db.add_all([completed, active])
+        db.flush()
+        completed_id = completed.id
+        active_id = active.id
+
+    signed_in = login(client)
+    headers = {"Authorization": f"Bearer {signed_in.json()['data']['accessToken']}"}
+    blocked = client.delete(f"/api/v1/admin/tasks/{active_id}", headers=headers)
+    assert blocked.status_code == 409
+    assert blocked.json()["error"]["code"] == "TASK_NOT_TERMINAL"
+
+    deleted = client.delete(f"/api/v1/admin/tasks/{completed_id}", headers=headers)
+    assert deleted.status_code == 204, deleted.text
+    with testing_session() as db:
+        assert db.get(ProcessingTask, completed_id) is None
+        assert db.get(ProcessingTask, active_id) is not None
+
+
 def test_authenticated_user_can_submit_feedback(test_context) -> None:
     client, testing_session, _ = test_context
     signed_in = login(client)

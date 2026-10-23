@@ -36,6 +36,15 @@ def test_health_endpoints(test_context):
     client, _, _ = test_context
     assert client.get("/api/v1/system/health/live").json()["data"]["status"] == "ok"
     assert client.get("/api/v1/system/health/ready").json()["data"]["database"] == "available"
+    pipeline = client.get("/api/v1/system/health/pipeline")
+    assert pipeline.status_code == 200
+    assert pipeline.json()["data"] == {
+        "status": "ready",
+        "dispatchMode": "inline",
+        "broker": "not_required",
+        "worker": "inline",
+        "workerCount": 1,
+    }
 
 
 def test_sso_disabled_and_open_redirect_rejected(test_context):

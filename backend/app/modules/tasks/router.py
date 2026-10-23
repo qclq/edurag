@@ -6,7 +6,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
@@ -17,11 +17,11 @@ from app.core.security import utcnow
 from app.db.session import get_db
 from app.modules.knowledge_bases.service import can_access, get_kb_or_404
 from app.modules.operations.service import record_audit
-from app.modules.tasks.models import ProcessingTask, TaskEvent
+from app.modules.tasks.models import ProcessingTask, TaskEvent, TaskItem
 from app.modules.tasks.schemas import RetryTask
-from app.modules.tasks.service import TERMINAL_STATUSES, create_task, event_payload, get_task_or_404, task_payload, update_task
+from app.modules.tasks.service import TERMINAL_STATUSES, create_task, event_payload, get_task_or_404, mark_task_dispatch_failed, task_payload, update_task
 from app.modules.users.models import User
-from app.workers.document_pipeline import dispatch_document_pipeline
+from app.workers.document_pipeline import dispatch_chunk_reembedding, dispatch_document_pipeline
 from app.workers.maintenance import dispatch_knowledge_base_rebuild
 
 
@@ -79,6 +79,33 @@ def get_task(
     task = get_task_or_404(db, task_id)
     _ensure_task_scope(db, task, user)
     return success(request, task_payload(task))
+
+
+@router.delete("/tasks/{task_id}", status_code=204, summary="删除已结束的任务记录")
+def delete_task_record(
+    task_id: uuid.UUID,
+    request: Request,
+    user: User = Depends(require_permissions("task.delete")),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, task_id)
+    _ensure_task_scope(db, task, user)
+    if task.status not in TERMINAL_STATUSES:
+        raise AppError(409, "TASK_NOT_TERMINAL", "只能删除已完成、失败或已取消的任务记录")
+    before = task_payload(task, include_events=False)
+    record_audit(
+        db,
+        actor=user,
+        module="task",
+        action="delete",
+        target_type="task",
+        target_id=task.id,
+        request=request,
+        before=before,
+    )
+    db.delete(task)
+    db.commit()
+    return Response(status_code=204)
 
 
 @router.get("/tasks/{task_id}/events", summary="任务事件流")
@@ -142,16 +169,27 @@ def retry_task(
         document_version_id=original.document_version_id,
         progress_text=f"从 {payload.from_stage or original.stage or '安全阶段'} 重试",
     )
+    for item in db.scalars(select(TaskItem).where(TaskItem.task_id == original.id)).all():
+        db.add(
+            TaskItem(
+                task_id=retried.id,
+                object_type=item.object_type,
+                object_id=item.object_id,
+            )
+        )
     record_audit(db, actor=user, module="task", action="retry", target_type="task", target_id=original.id, request=request, after={"newTaskId": str(retried.id), "fromStage": payload.from_stage})
     db.commit()
     if settings.environment != "test":
         try:
-            if retried.document_version_id:
+            if retried.type == "chunk_reembedding":
+                dispatch_chunk_reembedding(str(retried.id), settings)
+            elif retried.document_version_id:
                 dispatch_document_pipeline(str(retried.id), settings)
             elif retried.type == "knowledge_base_rebuild":
                 dispatch_knowledge_base_rebuild(str(retried.id), settings)
-        except RuntimeError:
-            pass
+        except Exception:
+            mark_task_dispatch_failed(db, retried)
+            db.commit()
     return success(request, task_payload(retried, include_events=False), status_code=202)
 
 

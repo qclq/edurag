@@ -41,10 +41,10 @@ from app.modules.knowledge_bases.models import KnowledgeBase
 from app.modules.knowledge_bases.service import can_access, get_kb_or_404
 from app.modules.operations.service import record_audit
 from app.modules.rag.service import retrieve
-from app.modules.tasks.models import ProcessingTask
-from app.modules.tasks.service import create_task, task_payload
+from app.modules.tasks.models import ProcessingTask, TaskItem
+from app.modules.tasks.service import create_task, mark_task_dispatch_failed, task_payload
 from app.modules.users.models import User
-from app.workers.document_pipeline import dispatch_document_pipeline
+from app.workers.document_pipeline import dispatch_chunk_reembedding, dispatch_document_pipeline
 
 
 router = APIRouter()
@@ -144,8 +144,11 @@ def post_ingestions(
         for task_id in task_ids:
             try:
                 dispatch_document_pipeline(task_id, settings)
-            except RuntimeError:
-                pass
+            except Exception:
+                failed_task = db.get(ProcessingTask, uuid.UUID(task_id))
+                if failed_task:
+                    mark_task_dispatch_failed(db, failed_task)
+                db.commit()
     items = [
         {
             "document": document_payload(db, get_document_or_404(db, document.id, user), detailed=True),
@@ -250,8 +253,9 @@ def new_version(
     if settings.environment != "test":
         try:
             dispatch_document_pipeline(str(task.id), settings)
-        except RuntimeError:
-            pass
+        except Exception:
+            mark_task_dispatch_failed(db, task)
+            db.commit()
     return success(request, {"versionId": str(version.id), "versionNo": version.version_no, "task": task_payload(task, include_events=False)}, status_code=202)
 
 
@@ -293,8 +297,9 @@ def reprocess_document(
     if settings.environment != "test":
         try:
             dispatch_document_pipeline(str(task.id), settings)
-        except RuntimeError:
-            pass
+        except Exception:
+            mark_task_dispatch_failed(db, task)
+            db.commit()
     return success(request, task_payload(task, include_events=False), status_code=202)
 
 
@@ -386,6 +391,7 @@ def patch_chunk(
     request: Request,
     user: User = Depends(require_permissions("chunk.update")),
     db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
 ):
     chunk = db.get(DocumentChunk, chunk_id)
     if not chunk:
@@ -401,8 +407,18 @@ def patch_chunk(
     chunk.vector_status = "pending"
     chunk.row_version += 1
     task, _ = create_task(db, type="chunk_reembedding", created_by=user.id, knowledge_base_id=document.knowledge_base_id, document_id=document.id, document_version_id=version.id, progress_text="等待重新生成切片向量")
+    db.add(TaskItem(task_id=task.id, object_type="document_chunk", object_id=chunk.id))
     record_audit(db, actor=user, module="document", action="chunk.update", target_type="chunk", target_id=chunk.id, request=request, before={"content": before}, after={"content": payload.content, "reason": payload.reason})
     db.commit()
+    if settings.environment != "test":
+        try:
+            dispatch_chunk_reembedding(str(task.id), settings)
+        except Exception:
+            mark_task_dispatch_failed(db, task)
+            db.commit()
+    db.expire_all()
+    chunk = db.get(DocumentChunk, chunk.id)
+    task = db.get(ProcessingTask, task.id)
     return success(request, {"chunk": chunk_payload(chunk, document), "task": task_payload(task, include_events=False)})
 
 

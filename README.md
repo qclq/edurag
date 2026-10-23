@@ -23,6 +23,18 @@ docker compose ps
 docker compose logs -f backend frontend
 ```
 
+文档任务一直停在“等待处理”时，先检查完整流水线，而不只是后端数据库健康状态：
+
+```powershell
+curl.exe -fsS https://你的域名/api/v1/system/health/pipeline
+docker compose ps
+docker compose logs --tail=200 worker redis milvus
+docker compose exec worker celery -A app.workers.celery_app:celery_app inspect ping --timeout=5
+docker stats --no-stream
+```
+
+`/health/ready` 只表示 API 与数据库可用；`/health/pipeline` 还会检查 Redis broker 和至少一个 Celery worker。小内存云服务器默认使用单 worker 进程，降低 LibreOffice、OCR 和向量化并发时的内存峰值；可通过 `CELERY_WORKER_CONCURRENCY` 调整。任务中心会直接提示后台处理服务未就绪，任务派发失败也会记录为可重试的明确错误，不再长期停留在排队状态。
+
 停止服务：
 
 ```powershell
