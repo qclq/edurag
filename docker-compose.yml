@@ -159,6 +159,8 @@ services:
       LIBREOFFICE_BINARY: ${LIBREOFFICE_BINARY:-soffice}
       OFFICE_CONVERSION_TIMEOUT_SECONDS: ${OFFICE_CONVERSION_TIMEOUT_SECONDS:-120}
       TASK_DISPATCH_MODE: celery
+      CELERY_WORKER_CONCURRENCY: ${CELERY_WORKER_CONCURRENCY:-3}
+      CELERY_MAX_TASKS_PER_CHILD: ${CELERY_MAX_TASKS_PER_CHILD:-20}
       MILVUS_ENABLED: "true"
       MILVUS_URI: http://milvus:19530
       MILVUS_DATABASE: default
@@ -181,7 +183,7 @@ services:
         condition: service_healthy
     volumes:
       - edurag-files:/app/data/files
-    command: ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=${CELERY_WORKER_CONCURRENCY:-1}", "--max-tasks-per-child=${CELERY_MAX_TASKS_PER_CHILD:-20}"]
+    command: ["python", "-m", "app.scripts.run_worker"]
     healthcheck:
       test: ["CMD-SHELL", "celery -A app.workers.celery_app:celery_app inspect ping --timeout=5 | grep -q pong"]
       interval: 15s

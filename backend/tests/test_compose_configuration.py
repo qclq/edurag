@@ -22,3 +22,11 @@ def test_python_services_receive_cookie_secure_setting():
         assert re.search(r"(?m)^      COOKIE_SECURE:\s*\$\{COOKIE_SECURE:-false\}\s*$", service), (
             f"{service_name} must receive COOKIE_SECURE because it creates the shared production Settings"
         )
+
+
+def test_worker_uses_bounded_concurrency_startup():
+    compose = COMPOSE_FILE.read_text(encoding="utf-8")
+    worker = _service_block(compose, "worker")
+
+    assert re.search(r"(?m)^      CELERY_WORKER_CONCURRENCY:\s*\$\{CELERY_WORKER_CONCURRENCY:-3\}\s*$", worker)
+    assert 'command: ["python", "-m", "app.scripts.run_worker"]' in worker

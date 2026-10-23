@@ -33,7 +33,7 @@ docker compose exec worker celery -A app.workers.celery_app:celery_app inspect p
 docker stats --no-stream
 ```
 
-`/health/ready` 只表示 API 与数据库可用；`/health/pipeline` 还会检查 Redis broker 和至少一个 Celery worker。小内存云服务器默认使用单 worker 进程，降低 LibreOffice、OCR 和向量化并发时的内存峰值；可通过 `CELERY_WORKER_CONCURRENCY` 调整。任务中心会直接提示后台处理服务未就绪，任务派发失败也会记录为可重试的明确错误，不再长期停留在排队状态。
+`/health/ready` 只表示 API 与数据库可用；`/health/pipeline` 还会检查 Redis broker 和至少一个 Celery worker。浏览器会同时上传最多 3 个文件，Celery worker 默认也会并行处理最多 3 个文档任务；`CELERY_WORKER_CONCURRENCY` 可在 1–3 之间调整，超出范围会自动限制。小内存云服务器可将其调低为 1，以降低 LibreOffice、OCR 和向量化并发时的内存峰值。任务中心会直接提示后台处理服务未就绪，任务派发失败也会记录为可重试的明确错误，不再长期停留在排队状态。
 
 停止服务：
 

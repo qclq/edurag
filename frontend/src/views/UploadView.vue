@@ -6,6 +6,7 @@ import { ArrowLeft, Check, Close, Delete, Document, Files, InfoFilled, Refresh, 
 import StatusPill from '../components/StatusPill.vue'
 import QuickKnowledgeBaseDialog from '../components/QuickKnowledgeBaseDialog.vue'
 import { authenticatedRequest, useAuth } from '../stores/auth'
+import { mapSettledWithConcurrency } from '../utils/concurrency'
 import { shouldEnableUploadOcr } from '../utils/upload-ocr'
 
 const { state } = useAuth()
@@ -21,6 +22,7 @@ const loadError = ref('')
 const pipelineError = ref('')
 const uploadRef = ref(null)
 const createKbOpen = ref(false)
+const maxConcurrentUploads = 3
 const config = ref({ kb:'', category:'规章制度', number:'', ocr:false, vectorize:true, chunk:512, overlap:64 })
 const serverUploadConfig = ref(null)
 const uploadLimits = computed(() => serverUploadConfig.value || state.bootstrap?.uploadLimits || {})
@@ -85,12 +87,10 @@ const submit = async (saveAsDraft = false) => {
   }
   if (config.value.overlap >= config.value.chunk) return ElMessage.warning('重叠窗口必须小于切片最大长度')
   submitting.value = true
-  const uploaded = []
-  let activeItem = null
   try {
-    for (const item of files.value) {
-      activeItem = item
-      if (!item.uploadId) {
+    const pendingUploads = files.value.filter(item => !item.uploadId)
+    const uploadResults = await mapSettledWithConcurrency(pendingUploads, maxConcurrentUploads, async item => {
+      try {
         item.state = 'uploading'
         item.detail = '正在上传文件…'
         const body = new FormData()
@@ -100,8 +100,20 @@ const submit = async (saveAsDraft = false) => {
         item.uploadId = result.uploadId
         item.state = 'uploaded'
         item.detail = result.duplicate ? '文件已暂存（检测到相同内容）' : '文件已暂存，等待提交入库'
+        return result
+      } catch (error) {
+        item.state = 'failed'
+        item.detail = error.message || '文件上传失败，可重试'
+        throw error
       }
-      uploaded.push({
+    })
+    const failedUploads = uploadResults.filter(result => result.status === 'rejected')
+    if (failedUploads.length) {
+      ElMessage.error(`${failedUploads.length} 个文件上传失败，其余文件已暂存；请重试失败文件`)
+      return
+    }
+
+    const uploaded = files.value.map(item => ({
         uploadId: item.uploadId,
         metadata: {
           knowledgeBaseId: config.value.kb,
@@ -110,9 +122,11 @@ const submit = async (saveAsDraft = false) => {
           documentNo: config.value.number || null,
           tags: [],
         },
-      })
-    }
-    activeItem = null
+      }))
+    files.value.forEach(item => {
+      item.state = 'uploaded'
+      item.detail = '文件已暂存，正在提交入库'
+    })
     const result = await authenticatedRequest('/admin/document-ingestions', {
       method: 'POST',
       body: { items: uploaded, processingConfig: { ocrEnabled: config.value.ocr, chunkSize: config.value.chunk, chunkOverlap: config.value.overlap }, saveAsDraft },
@@ -127,15 +141,10 @@ const submit = async (saveAsDraft = false) => {
     if (saveAsDraft) await router.push('/admin/document')
     else mode.value = '任务中心'
   } catch (error) {
-    if (activeItem) {
-      activeItem.state = 'failed'
-      activeItem.detail = error.message || '文件上传失败，可重试'
-    } else {
-      files.value.filter(item => item.uploadId).forEach(item => {
-        item.state = 'failed'
-        item.detail = '文件已暂存，但入库提交失败；点击确认可直接重试'
-      })
-    }
+    files.value.filter(item => item.uploadId).forEach(item => {
+      item.state = 'failed'
+      item.detail = '文件已暂存，但入库提交失败；点击确认可直接重试'
+    })
     ElMessage.error(error.message || '上传入库失败')
   } finally { submitting.value = false }
 }
@@ -276,7 +285,7 @@ onBeforeUnmount(() => {
 
     <div v-if="mode==='上传文档'" class="upload-grid">
       <section class="upload-left">
-        <el-upload ref="uploadRef" class="dropzone" drag action="#" multiple :limit="maxFiles" :auto-upload="false" :show-file-list="false" :on-change="handleUpload" :on-exceed="() => ElMessage.warning(`单次最多选择 ${maxFiles} 个文件`)" :accept="accept">
+        <el-upload ref="uploadRef" class="dropzone" drag action="#" multiple :limit="maxFiles" :disabled="submitting" :auto-upload="false" :show-file-list="false" :on-change="handleUpload" :on-exceed="() => ElMessage.warning(`单次最多选择 ${maxFiles} 个文件`)" :accept="accept">
           <el-icon class="upload-icon"><UploadFilled /></el-icon><h3>点击上传或将文件拖拽至此处</h3><p>{{uploadLimitText}}</p><el-button class="primary-btn" :icon="Files">选取本地文件</el-button><div class="file-types"><i v-for="(extensions,label) in formatGroups" :key="label" :title="extensions.map(item => `.${item}`).join('、')">{{label}}</i></div>
         </el-upload>
 
