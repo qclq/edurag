@@ -153,6 +153,7 @@ services:
       DATABASE_URL: postgresql+pg8000://${POSTGRES_USER:-edurag}:${POSTGRES_PASSWORD:-edurag}@postgres:5432/${POSTGRES_DB:-edurag}
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: ${SECRET_KEY:-docker-development-secret-change-before-production-2026}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
       STORAGE_BACKEND: local
       STORAGE_LOCAL_PATH: /app/data/files
       LIBREOFFICE_BINARY: ${LIBREOFFICE_BINARY:-soffice}
@@ -198,6 +199,7 @@ services:
       DATABASE_URL: postgresql+pg8000://${POSTGRES_USER:-edurag}:${POSTGRES_PASSWORD:-edurag}@postgres:5432/${POSTGRES_DB:-edurag}
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: ${SECRET_KEY:-docker-development-secret-change-before-production-2026}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
       TASK_DISPATCH_MODE: celery
       MILVUS_ENABLED: "true"
       QWEN_API_KEY: ${QWEN_API_KEY:-}
